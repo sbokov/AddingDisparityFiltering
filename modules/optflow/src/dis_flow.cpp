@@ -75,14 +75,14 @@ class DISOpticalFlowImpl : public DISOpticalFlow
     void setGradientDescentIterations(int val) { grad_descent_iter = val; }
 
   private:                   // internal buffers
-    vector<Mat_<uchar>> I0s; // gaussian pyramid for the current frame
-    vector<Mat_<uchar>> I1s; // gaussian pyramid for the next frame
+    vector< Mat_<uchar> > I0s; // gaussian pyramid for the current frame
+    vector< Mat_<uchar> > I1s; // gaussian pyramid for the next frame
 
-    vector<Mat_<short>> I0xs; // gaussian pyramid for the x gradient of the current frame
-    vector<Mat_<short>> I0ys; // gaussian pyramid for the y gradient of the current frame
+    vector< Mat_<short> > I0xs; // gaussian pyramid for the x gradient of the current frame
+    vector< Mat_<short> > I0ys; // gaussian pyramid for the y gradient of the current frame
 
-    vector<Mat_<float>> Ux; // x component of the flow vectors
-    vector<Mat_<float>> Uy; // y component of the flow vectors
+    vector< Mat_<float> > Ux; // x component of the flow vectors
+    vector< Mat_<float> > Uy; // y component of the flow vectors
 
     Mat_<Vec2f> U; // buffers for the merged flow
 

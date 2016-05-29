@@ -193,7 +193,7 @@ CV_EXPORTS_W Ptr<DenseOpticalFlow> createOptFlow_SparseToDense();
 
 /** @brief DIS optical flow algorithm.
 
-This class implements the Dense Inverse Search (DIS) optical flow algorithm. More 
+This class implements the Dense Inverse Search (DIS) optical flow algorithm. More
 details about the algorithm can be found at @cite Kroeger2016 .
 */
 class CV_EXPORTS_W DISOpticalFlow : public DenseOpticalFlow

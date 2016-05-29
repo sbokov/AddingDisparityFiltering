@@ -424,7 +424,7 @@ void DISOpticalFlowImpl::calc(InputArray I0, InputArray I1, InputOutputArray flo
     Mat I1Mat = I1.getMat();
     flow.create(I1Mat.size(), CV_32FC2);
     Mat &flowMat = flow.getMatRef();
-    coarsest_scale = (int)(log2((2 * I0Mat.cols) / (4.0 * patch_size)) + 0.5) - 1;
+    coarsest_scale = (int)(log((2 * I0Mat.cols) / (4.0 * patch_size))/log(2.0) + 0.5) - 1;
 
     prepareBuffers(I0Mat, I1Mat);
     Ux[coarsest_scale].setTo(0.0f);

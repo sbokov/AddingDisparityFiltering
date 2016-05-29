@@ -51,7 +51,7 @@ def evaluate_sequence(sequence, algorithm, executable, percent, img_files,
                          (algorithm, sequence, i, len(img_files) - 1)),
         sys.stdout.flush()
         if int(percent * i) != int(percent * (i + 1)):
-            res_string = check_output([executable, img_files[i], img_files[i + 1], 
+            res_string = check_output([executable, img_files[i], img_files[i + 1],
                                        algorithm, gt_files[i]])
             res.append(parse_evaluation_result(res_string, i))
     return res

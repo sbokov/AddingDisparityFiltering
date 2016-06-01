@@ -99,6 +99,8 @@ class DISOpticalFlowImpl : public DISOpticalFlow
     Mat_<float> I0xy_buf_aux;
     ////////////////////////////////////////////////////////////
 
+    vector< Ptr<VariationalRefinement> > variational_refinement_processors;
+
   private: // private methods
     void prepareBuffers(Mat &I0, Mat &I1);
     void precomputeStructureTensor(Mat &dst_I0xx, Mat &dst_I0yy, Mat &dst_I0xy, Mat &I0x, Mat &I0y);
@@ -122,6 +124,7 @@ void DISOpticalFlowImpl::prepareBuffers(Mat &I0, Mat &I1)
     I0ys.resize(coarsest_scale + 1);
     Ux.resize(coarsest_scale + 1);
     Uy.resize(coarsest_scale + 1);
+    variational_refinement_processors.resize(coarsest_scale + 1);
     int fraction = 1;
     int cur_rows = 0, cur_cols = 0;
 
@@ -163,8 +166,12 @@ void DISOpticalFlowImpl::prepareBuffers(Mat &I0, Mat &I1)
             I0xs[i].create(cur_rows, cur_cols);
             I0ys[i].create(cur_rows, cur_cols);
             spatialGradient(I0s[i], I0xs[i], I0ys[i]);
+            //Sobel(I0s[i], I0xs[i], CV_16S, 1, 0, 1);
+            //Sobel(I0s[i], I0ys[i], CV_16S, 0, 1, 1);
             Ux[i].create(cur_rows, cur_cols);
             Uy[i].create(cur_rows, cur_cols);
+            variational_refinement_processors[i] = createVariationalFlowRefinement();
+            variational_refinement_processors[i]->setFixedPointIterations(i + 1);
         }
     }
 }
@@ -434,7 +441,11 @@ void DISOpticalFlowImpl::calc(InputArray I0, InputArray I1, InputOutputArray flo
     {
         patchInverseSearch(Sx, Sy, Ux[i], Uy[i], I0s[i], I0xs[i], I0ys[i], I1s[i]);
         densification(Ux[i], Uy[i], Sx, Sy, I0s[i], I1s[i]);
-        // TODO: variational refinement step
+        // variational refinement step
+        Mat uxy[] = { Ux[i], Uy[i] };
+        merge(uxy, 2, U);
+        variational_refinement_processors[i]->calc(I0s[i], I1s[i], U);
+        split(U, uxy);
 
         if (i > finest_scale)
         {

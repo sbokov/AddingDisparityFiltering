@@ -154,6 +154,57 @@ to the flow in the horizontal direction (u), second - vertical (v).
  */
 CV_EXPORTS_W bool writeOpticalFlow( const String& path, InputArray flow );
 
+/** @brief Variational optical flow refinement
+
+This class implements variational refinement of the input flow field.
+TODO: Add more details
+*/
+class CV_EXPORTS_W VariationalRefinement : public DenseOpticalFlow
+{
+public:
+    /** @brief calc function overload to efficiently handle separate horizontal (u) and vertical (v) flow components */
+    CV_WRAP virtual void calcUV(InputArray I0, InputArray I1, InputOutputArray flow_u, InputOutputArray flow_v) = 0;
+
+    /** @brief 
+    @see setFixedPointIterations */
+    virtual int getFixedPointIterations() const = 0;
+    /** @copybrief getFixedPointIterations @see getFixedPointIterations */
+    virtual void setFixedPointIterations(int val) = 0;
+
+    /** @brief 
+    @see setSorIterations */
+    virtual int getSorIterations() const = 0;
+    /** @copybrief getSorIterations @see getSorIterations */
+    virtual void setSorIterations(int val) = 0;
+
+    /** @brief 
+    @see setOmega */
+    virtual float getOmega() const = 0;
+    /** @copybrief getOmega @see getOmega */
+    virtual void setOmega(float val) = 0;
+
+    /** @brief
+    @see setAlpha */
+    virtual float getAlpha() const = 0;
+    /** @copybrief getAlpha @see getAlpha */
+    virtual void setAlpha(float val) = 0;
+
+    /** @brief 
+    @see setDelta */
+    virtual float getDelta() const = 0;
+    /** @copybrief getDelta @see getDelta */
+    virtual void setDelta(float val) = 0;
+
+    /** @brief
+    @see setGamma */
+    virtual float getGamma() const = 0;
+    /** @copybrief getGamma @see getGamma */
+    virtual void setGamma(float val) = 0;
+};
+
+/** @brief Creates an instance of VariationalRefinement
+*/
+CV_EXPORTS_W Ptr<VariationalRefinement> createVariationalFlowRefinement();
 
 /** @brief DeepFlow optical flow algorithm implementation.
 

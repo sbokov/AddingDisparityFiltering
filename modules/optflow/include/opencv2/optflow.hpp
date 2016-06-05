@@ -162,7 +162,8 @@ TODO: Add more details
 class CV_EXPORTS_W VariationalRefinement : public DenseOpticalFlow
 {
 public:
-    /** @brief calc function overload to efficiently handle separate horizontal (u) and vertical (v) flow components */
+    /** @brief calc function overload to handle separate horizontal (u) and vertical (v) flow components 
+    (to avoid extra splits/merges) */
     CV_WRAP virtual void calcUV(InputArray I0, InputArray I1, InputOutputArray flow_u, InputOutputArray flow_v) = 0;
 
     /** @brief 
@@ -253,9 +254,9 @@ public:
     /** @brief Finest level of the gaussian pyramid on which the flow is computed (zero level
         corresponds to the original image resolution).The final flow is obtained by bilinear upscaling.
         @see setFinestScale */
-    virtual int getFinestScale() const = 0;
+    CV_WRAP virtual int getFinestScale() const = 0;
     /** @copybrief getFinestScale @see getFinestScale */
-    virtual void setFinestScale(int val) = 0;
+    CV_WRAP virtual void setFinestScale(int val) = 0;
 
     /** @brief Size of an image patch for matching (in pixels)
         @see setPatchSize */

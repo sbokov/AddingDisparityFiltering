@@ -40,10 +40,11 @@
 //
 //M*/
 
-#include "precomp.hpp"
 #include "opencv2/imgproc.hpp"
+#include "precomp.hpp"
 using namespace std;
 #define EPS 0.001F
+#define INF 1E+10F
 
 namespace cv
 {
@@ -63,6 +64,7 @@ class DISOpticalFlowImpl : public DISOpticalFlow
     int patch_size;
     int patch_stride;
     int grad_descent_iter;
+    int num_stripes;
 
   public: // getters and setters
     int getFinestScale() const { return finest_scale; }
@@ -74,15 +76,15 @@ class DISOpticalFlowImpl : public DISOpticalFlow
     int getGradientDescentIterations() const { return grad_descent_iter; }
     void setGradientDescentIterations(int val) { grad_descent_iter = val; }
 
-  private:                   // internal buffers
-    vector< Mat_<uchar> > I0s; // gaussian pyramid for the current frame
-    vector< Mat_<uchar> > I1s; // gaussian pyramid for the next frame
+  protected:                 // internal buffers
+    vector<Mat_<uchar>> I0s; // gaussian pyramid for the current frame
+    vector<Mat_<uchar>> I1s; // gaussian pyramid for the next frame
 
-    vector< Mat_<short> > I0xs; // gaussian pyramid for the x gradient of the current frame
-    vector< Mat_<short> > I0ys; // gaussian pyramid for the y gradient of the current frame
+    vector<Mat_<short>> I0xs; // gaussian pyramid for the x gradient of the current frame
+    vector<Mat_<short>> I0ys; // gaussian pyramid for the y gradient of the current frame
 
-    vector< Mat_<float> > Ux; // x component of the flow vectors
-    vector< Mat_<float> > Uy; // y component of the flow vectors
+    vector<Mat_<float>> Ux; // x component of the flow vectors
+    vector<Mat_<float>> Uy; // y component of the flow vectors
 
     Mat_<Vec2f> U; // buffers for the merged flow
 
@@ -99,21 +101,44 @@ class DISOpticalFlowImpl : public DISOpticalFlow
     Mat_<float> I0xy_buf_aux;
     ////////////////////////////////////////////////////////////
 
-    vector< Ptr<VariationalRefinement> > variational_refinement_processors;
+    vector<Ptr<VariationalRefinement>> variational_refinement_processors;
 
   private: // private methods
     void prepareBuffers(Mat &I0, Mat &I1);
     void precomputeStructureTensor(Mat &dst_I0xx, Mat &dst_I0yy, Mat &dst_I0xy, Mat &I0x, Mat &I0y);
-    void patchInverseSearch(Mat &dst_Sx, Mat &dst_Sy, Mat &src_Ux, Mat &src_Uy, Mat &I0, Mat &I0x, Mat &I0y, Mat &I1);
-    void densification(Mat &dst_Ux, Mat &dst_Uy, Mat &src_Sx, Mat &src_Sy, Mat &I0, Mat &I1);
+
+    struct PatchGradientDescent_ParBody : public ParallelLoopBody
+    {
+        DISOpticalFlowImpl *dis;
+        Mat *Sx, *Sy, *Ux, *Uy, *I0, *I1, *I0x, *I0y;
+        int nstripes, stripe_sz;
+        int hs;
+
+        PatchGradientDescent_ParBody(DISOpticalFlowImpl &_dis, int _nstripes, int _h, Mat &dst_Sx, Mat &dst_Sy,
+                                     Mat &src_Ux, Mat &src_Uy, Mat &_I0, Mat &_I1, Mat &_I0x, Mat &_I0y);
+        void operator()(const Range &range) const;
+    };
+
+    struct Densification_ParBody : public ParallelLoopBody
+    {
+        DISOpticalFlowImpl *dis;
+        Mat *Ux, *Uy, *Sx, *Sy, *I0, *I1;
+        int nstripes, stripe_sz;
+        int h;
+
+        Densification_ParBody(DISOpticalFlowImpl &_dis, int _nstripes, int _h, Mat &dst_Ux, Mat &dst_Uy, Mat &src_Sx,
+                              Mat &src_Sy, Mat &_I0, Mat &_I1);
+        void operator()(const Range &range) const;
+    };
 };
 
 DISOpticalFlowImpl::DISOpticalFlowImpl()
 {
-    finest_scale = 3;
+    finest_scale = 0;
     patch_size = 9;
     patch_stride = 4;
     grad_descent_iter = 12;
+    num_stripes = getNumThreads();
 }
 
 void DISOpticalFlowImpl::prepareBuffers(Mat &I0, Mat &I1)
@@ -166,12 +191,12 @@ void DISOpticalFlowImpl::prepareBuffers(Mat &I0, Mat &I1)
             I0xs[i].create(cur_rows, cur_cols);
             I0ys[i].create(cur_rows, cur_cols);
             spatialGradient(I0s[i], I0xs[i], I0ys[i]);
-            //Sobel(I0s[i], I0xs[i], CV_16S, 1, 0, 1);
-            //Sobel(I0s[i], I0ys[i], CV_16S, 0, 1, 1);
+            // Sobel(I0s[i], I0xs[i], CV_16S, 1, 0, 1);
+            // Sobel(I0s[i], I0ys[i], CV_16S, 0, 1, 1);
             Ux[i].create(cur_rows, cur_cols);
             Uy[i].create(cur_rows, cur_cols);
             variational_refinement_processors[i] = createVariationalFlowRefinement();
-            variational_refinement_processors[i]->setFixedPointIterations(i + 1);
+            variational_refinement_processors[i]->setFixedPointIterations(5*i + 5);
         }
     }
 }
@@ -273,32 +298,41 @@ void DISOpticalFlowImpl::precomputeStructureTensor(Mat &dst_I0xx, Mat &dst_I0yy,
     }
 }
 
-void DISOpticalFlowImpl::patchInverseSearch(Mat &dst_Sx, Mat &dst_Sy, Mat &src_Ux, Mat &src_Uy, Mat &I0, Mat &I0x,
-                                            Mat &I0y, Mat &I1)
+DISOpticalFlowImpl::PatchGradientDescent_ParBody::PatchGradientDescent_ParBody(DISOpticalFlowImpl &_dis, int _nstripes,
+                                                                               int _hs, Mat &dst_Sx, Mat &dst_Sy,
+                                                                               Mat &src_Ux, Mat &src_Uy, Mat &_I0,
+                                                                               Mat &_I1, Mat &_I0x, Mat &_I0y)
+    : dis(&_dis), nstripes(_nstripes), hs(_hs), Sx(&dst_Sx), Sy(&dst_Sy), Ux(&src_Ux), Uy(&src_Uy), I0(&_I0), I1(&_I1),
+      I0x(&_I0x), I0y(&_I0y)
 {
-    float *Ux_ptr = src_Ux.ptr<float>();
-    float *Uy_ptr = src_Uy.ptr<float>();
-    float *Sx_ptr = dst_Sx.ptr<float>();
-    float *Sy_ptr = dst_Sy.ptr<float>();
-    uchar *I0_ptr = I0.ptr<uchar>();
-    uchar *I1_ptr = I1.ptr<uchar>();
-    short *I0x_ptr = I0x.ptr<short>();
-    short *I0y_ptr = I0y.ptr<short>();
-    int w = I0.cols;
-    int h = I1.rows;
-    int psz2 = patch_size / 2;
-    // width and height of the sparse OF fields:
-    int ws = 1 + (w - patch_size) / patch_stride;
-    int hs = 1 + (h - patch_size) / patch_stride;
+    stripe_sz = (int)ceil(hs / (double)nstripes);
+}
 
-    precomputeStructureTensor(I0xx_buf, I0yy_buf, I0xy_buf, I0x, I0y);
-    float *xx_ptr = I0xx_buf.ptr<float>();
-    float *yy_ptr = I0yy_buf.ptr<float>();
-    float *xy_ptr = I0xy_buf.ptr<float>();
+void DISOpticalFlowImpl::PatchGradientDescent_ParBody::operator()(const Range &range) const
+{
+    int start = min(range.start * stripe_sz, hs);
+    int end = min(range.end * stripe_sz, hs);
+    int w = I0->cols;
+    int h = I0->rows;
+    // width of the sparse OF field
+    int ws = 1 + (w - dis->patch_size) / dis->patch_stride;
+    int psz2 = dis->patch_size / 2;
 
-    // perform a fixed number of gradient descent iterations for each patch:
-    int i = psz2;
-    for (int is = 0; is < hs; is++)
+    float *Ux_ptr = Ux->ptr<float>();
+    float *Uy_ptr = Uy->ptr<float>();
+    float *Sx_ptr = Sx->ptr<float>();
+    float *Sy_ptr = Sy->ptr<float>();
+    uchar *I0_ptr = I0->ptr<uchar>();
+    uchar *I1_ptr = I1->ptr<uchar>();
+    short *I0x_ptr = I0x->ptr<short>();
+    short *I0y_ptr = I0y->ptr<short>();
+
+    float *xx_ptr = dis->I0xx_buf.ptr<float>();
+    float *yy_ptr = dis->I0yy_buf.ptr<float>();
+    float *xy_ptr = dis->I0xy_buf.ptr<float>();
+
+    int i = psz2 + start * dis->patch_stride;
+    for (int is = start; is < end; is++)
     {
         int j = psz2;
         for (int js = 0; js < ws; js++)
@@ -311,8 +345,8 @@ void DISOpticalFlowImpl::patchInverseSearch(Mat &dst_Sx, Mat &dst_Sy, Mat &src_U
             float invH11 = yy_ptr[is * ws + js] / detH;
             float invH12 = -xy_ptr[is * ws + js] / detH;
             float invH22 = xx_ptr[is * ws + js] / detH;
-            float prev_sum_diff = 100000000.0f;
-            for (int t = 0; t < grad_descent_iter; t++)
+            float prev_sum_diff = INF;
+            for (int t = 0; t < dis->grad_descent_iter; t++)
             {
                 float dUx = 0, dUy = 0;
                 float diff = 0;
@@ -345,7 +379,7 @@ void DISOpticalFlowImpl::patchInverseSearch(Mat &dst_Sx, Mat &dst_Sy, Mat &src_U
                     break;
                 prev_sum_diff = sum_diff;
             }
-            if (norm(Vec2f(cur_Ux - Ux_ptr[i * w + j], cur_Uy - Uy_ptr[i * w + j])) <= patch_size)
+            if (norm(Vec2f(cur_Ux - Ux_ptr[i * w + j], cur_Uy - Uy_ptr[i * w + j])) <= dis->patch_size)
             {
                 Sx_ptr[is * ws + js] = cur_Ux;
                 Sy_ptr[is * ws + js] = cur_Uy;
@@ -355,34 +389,48 @@ void DISOpticalFlowImpl::patchInverseSearch(Mat &dst_Sx, Mat &dst_Sy, Mat &src_U
                 Sx_ptr[is * ws + js] = Ux_ptr[i * w + j];
                 Sy_ptr[is * ws + js] = Uy_ptr[i * w + j];
             }
-            j += patch_stride;
+            j += dis->patch_stride;
         }
-        i += patch_stride;
+        i += dis->patch_stride;
     }
 }
 
-void DISOpticalFlowImpl::densification(Mat &dst_Ux, Mat &dst_Uy, Mat &src_Sx, Mat &src_Sy, Mat &I0, Mat &I1)
+DISOpticalFlowImpl::Densification_ParBody::Densification_ParBody(DISOpticalFlowImpl &_dis, int _nstripes, int _h,
+                                                                 Mat &dst_Ux, Mat &dst_Uy, Mat &src_Sx, Mat &src_Sy,
+                                                                 Mat &_I0, Mat &_I1)
+    : dis(&_dis), nstripes(_nstripes), h(_h), Sx(&src_Sx), Sy(&src_Sy), Ux(&dst_Ux), Uy(&dst_Uy), I0(&_I0), I1(&_I1)
 {
-    float *Ux_ptr = dst_Ux.ptr<float>();
-    float *Uy_ptr = dst_Uy.ptr<float>();
-    float *Sx_ptr = src_Sx.ptr<float>();
-    float *Sy_ptr = src_Sy.ptr<float>();
-    uchar *I0_ptr = I0.ptr<uchar>();
-    uchar *I1_ptr = I1.ptr<uchar>();
-    int w = I0.cols;
-    int h = I0.rows;
-    int psz2 = patch_size / 2;
-    // width of the sparse OF fields:
-    int ws = 1 + (w - patch_size) / patch_stride;
+    stripe_sz = (int)ceil(h / (double)nstripes);
+}
+
+void DISOpticalFlowImpl::Densification_ParBody::operator()(const Range &range) const
+{
+    int start = min(range.start * stripe_sz, h);
+    int end = min(range.end * stripe_sz, h);
+    float *Ux_ptr = Ux->ptr<float>();
+    float *Uy_ptr = Uy->ptr<float>();
+    float *Sx_ptr = Sx->ptr<float>();
+    float *Sy_ptr = Sy->ptr<float>();
+    uchar *I0_ptr = I0->ptr<uchar>();
+    uchar *I1_ptr = I1->ptr<uchar>();
+    int w = I0->cols;
+    // width of the sparse OF field:
+    int ws = 1 + (w - dis->patch_size) / dis->patch_stride;
+    int psz2 = dis->patch_size / 2;
 
     int start_x;
     int start_y;
 
     start_y = psz2;
-    for (int i = 0; i < h; i++)
+    for (int i = 0; i < start; i++)
     {
-        if (i - psz2 > start_y && start_y + patch_stride < h - psz2)
-            start_y += patch_stride;
+        if (i - psz2 > start_y && start_y + dis->patch_stride < h - psz2)
+            start_y += dis->patch_stride;
+    }
+    for (int i = start; i < end; i++)
+    {
+        if (i - psz2 > start_y && start_y + dis->patch_stride < h - psz2)
+            start_y += dis->patch_stride;
         start_x = psz2;
         for (int j = 0; j < w; j++)
         {
@@ -390,15 +438,15 @@ void DISOpticalFlowImpl::densification(Mat &dst_Ux, Mat &dst_Uy, Mat &src_Sx, Ma
             float sum_Ux = 0.0f;
             float sum_Uy = 0.0f;
 
-            if (j - psz2 > start_x && start_x + patch_stride < w - psz2)
-                start_x += patch_stride;
+            if (j - psz2 > start_x && start_x + dis->patch_stride < w - psz2)
+                start_x += dis->patch_stride;
 
-            for (int pos_y = start_y; pos_y <= min(i + psz2, h - psz2 - 1); pos_y += patch_stride)
-                for (int pos_x = start_x; pos_x <= min(j + psz2, w - psz2 - 1); pos_x += patch_stride)
+            for (int pos_y = start_y; pos_y <= min(i + psz2, h - psz2 - 1); pos_y += dis->patch_stride)
+                for (int pos_x = start_x; pos_x <= min(j + psz2, w - psz2 - 1); pos_x += dis->patch_stride)
                 {
                     float diff;
-                    int is = (pos_y - psz2) / patch_stride;
-                    int js = (pos_x - psz2) / patch_stride;
+                    int is = (pos_y - psz2) / dis->patch_stride;
+                    int js = (pos_x - psz2) / dis->patch_stride;
                     float j_shifted = min(max(j + Sx_ptr[is * ws + js], 0.0f), w - 1.0f - EPS);
                     float i_shifted = min(max(i + Sy_ptr[is * ws + js], 0.0f), h - 1.0f - EPS);
                     int j_lower = (int)j_shifted;
@@ -431,21 +479,22 @@ void DISOpticalFlowImpl::calc(InputArray I0, InputArray I1, InputOutputArray flo
     Mat I1Mat = I1.getMat();
     flow.create(I1Mat.size(), CV_32FC2);
     Mat &flowMat = flow.getMatRef();
-    coarsest_scale = (int)(log((2 * I0Mat.cols) / (4.0 * patch_size))/log(2.0) + 0.5) - 1;
+    coarsest_scale = (int)(log((2 * I0Mat.cols) / (4.0 * patch_size)) / log(2.0) + 0.5) - 1;
 
     prepareBuffers(I0Mat, I1Mat);
     Ux[coarsest_scale].setTo(0.0f);
     Uy[coarsest_scale].setTo(0.0f);
 
+    int hs;
     for (int i = coarsest_scale; i >= finest_scale; i--)
     {
-        patchInverseSearch(Sx, Sy, Ux[i], Uy[i], I0s[i], I0xs[i], I0ys[i], I1s[i]);
-        densification(Ux[i], Uy[i], Sx, Sy, I0s[i], I1s[i]);
-        // variational refinement step
-        Mat uxy[] = { Ux[i], Uy[i] };
-        merge(uxy, 2, U);
-        variational_refinement_processors[i]->calc(I0s[i], I1s[i], U);
-        split(U, uxy);
+        hs = 1 + (I0s[i].rows - patch_size) / patch_stride; // height of the sparse OF field
+        precomputeStructureTensor(I0xx_buf, I0yy_buf, I0xy_buf, I0xs[i], I0ys[i]);
+        parallel_for_(Range(0, num_stripes), PatchGradientDescent_ParBody(*this, num_stripes, hs, Sx, Sy, Ux[i], Uy[i],
+                                                                          I0s[i], I1s[i], I0xs[i], I0ys[i]));
+        parallel_for_(Range(0, num_stripes),
+                      Densification_ParBody(*this, num_stripes, I0s[i].rows, Ux[i], Uy[i], Sx, Sy, I0s[i], I1s[i]));
+        variational_refinement_processors[i]->calcUV(I0s[i], I1s[i], Ux[i], Uy[i]);
 
         if (i > finest_scale)
         {
@@ -478,6 +527,10 @@ void DISOpticalFlowImpl::collectGarbage()
     I0xx_buf_aux.release();
     I0yy_buf_aux.release();
     I0xy_buf_aux.release();
+
+    for (int i = finest_scale; i <= coarsest_scale; i++)
+        variational_refinement_processors[i]->collectGarbage();
+    variational_refinement_processors.clear();
 }
 
 Ptr<DISOpticalFlow> createOptFlow_DIS() { return makePtr<DISOpticalFlowImpl>(); }

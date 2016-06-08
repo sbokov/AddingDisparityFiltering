@@ -41,6 +41,7 @@
 //M*/
 
 #include "precomp.hpp"
+#include "opencv2/core/hal/intrin.hpp"
 using namespace std;
 
 namespace cv
@@ -63,6 +64,10 @@ class VariationalRefinementImpl : public VariationalRefinement
     float alpha, delta, gamma;
     float zeta, epsilon;
     int num_stripes;
+
+protected: // timings (temporary)
+    double time_terms;
+    double time_SOR;
 
   public: // getters and setters
     int getFixedPointIterations() const { return fixedPointIterations; }
@@ -133,6 +138,8 @@ VariationalRefinementImpl::VariationalRefinementImpl()
     zeta = 0.1f;
     epsilon = 0.001f;
     num_stripes = getNumThreads();
+    time_terms = 0.0;
+    time_SOR = 0.0;
 }
 
 void VariationalRefinementImpl::warpImage(Mat &dst, const Mat &src, const Mat &flow_u, const Mat &flow_v)
@@ -250,9 +257,9 @@ void VariationalRefinementImpl::computeDataTerm(const Mat &dW_u, const Mat &dW_v
             weight = delta2 / sqrt(Ik1z * Ik1z / derivNorm + epsilon_squared);
             // Add respective color constancy components to the linear sustem coefficients:
             // mult = weight / derivNorm;
-            *pa11 = weight * ((float)*pIx * *pIx / derivNorm);
+            *pa11 = weight * ((float)*pIx * *pIx / derivNorm) + zeta_squared;
             *pa12 = weight * ((float)*pIx * *pIy / derivNorm);
-            *pa22 = weight * ((float)*pIy * *pIy / derivNorm);
+            *pa22 = weight * ((float)*pIy * *pIy / derivNorm) + zeta_squared;
             *pb1 = -weight * ((float)*pIz * *pIx / derivNorm);
             *pb2 = -weight * ((float)*pIz * *pIy / derivNorm);
 
@@ -749,10 +756,16 @@ void VariationalRefinementImpl::calcUV(InputArray I0, InputArray I1, InputOutput
     dW_u.setTo(0.0f);
     dW_v.setTo(0.0f);
     int SOR_chunk_size = 10; // ideally, something that just fits into one cache line
+    double  startTick, time;
     for (int i = 0; i < fixedPointIterations; i++)
     {
+        startTick = (double)getTickCount();
         parallel_for_(Range(0, num_stripes),
                       ComputeTerms_ParBody(*this, num_stripes, I0Mat.rows, W_u, W_v, dW_u, dW_v, tempW_u, tempW_v));
+        time = ((double)getTickCount() - startTick) / getTickFrequency();
+        time_terms += time;
+
+        startTick = (double)getTickCount();
         for (int j = 0; j < sorIterations; j++)
         {
             // compute all red vertices in parallel:
@@ -762,6 +775,8 @@ void VariationalRefinementImpl::calcUV(InputArray I0, InputArray I1, InputOutput
             parallel_for_(Range(0, num_stripes),
                           RedBlackSOR_ParBody(*this, false, SOR_chunk_size, num_stripes, I0Mat.rows, dW_u, dW_v));
         }
+        time = ((double)getTickCount() - startTick) / getTickFrequency();
+        time_SOR += time;
         tempW_u = W_u + dW_u;
         tempW_v = W_v + dW_v;
     }
@@ -792,6 +807,10 @@ void VariationalRefinementImpl::collectGarbage()
     Iyy.release();
     Ixz.release();
     Iyz.release();
+
+    printf("    Data and smoothness terms: %.1f ms\n", 1000 * time_terms);
+    printf("    SOR: %.1f ms\n", 1000 * time_SOR);
+    printf("\n");
 }
 
 Ptr<VariationalRefinement> createVariationalFlowRefinement() { return makePtr<VariationalRefinementImpl>(); }

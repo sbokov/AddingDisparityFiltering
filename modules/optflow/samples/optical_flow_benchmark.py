@@ -177,6 +177,12 @@ def build_chart(dst_folder, src_folder, percent, dataset):
     marker_idx = 0
     colors = ["b", "g", "r"]
     color_idx = 0
+    x_line1 = []
+    y_line1 = []
+    line_name1 = ""
+    x_line2 = []
+    y_line2 = []
+    line_name2 = ""
     for file in src_files:
         data = load_json(file)
         name = os.path.basename(file).split('.')[0]
@@ -198,11 +204,28 @@ def build_chart(dst_folder, src_folder, percent, dataset):
         marker_idx += 1
         if marker_idx >= len(markers):
             marker_idx = 0
-        plt.gca().plot([average_time], [average_error],
-                       marker_style,
-                       markersize=14,
-                       label=name)
-
+        if "DISflow--2016-06-06" in file:
+            x_line1.append(average_time)
+            y_line1.append(average_error)
+            line_name1 = name
+        elif "DISflow--2016-06-08" in file:
+            x_line2.append(average_time)
+            y_line2.append(average_error)
+            line_name2 = name
+        else:
+            plt.gca().plot([average_time], [average_error],
+                           marker_style,
+                           markersize=14,
+                           label=name)
+    plt.gca().plot(x_line1, y_line1,
+                           'ro' + "-",
+                           markersize=14,
+                           label=line_name1)
+    plt.gca().plot(x_line2, y_line2,
+                           'gh' + "-",
+                           markersize=14,
+                           label=line_name2)
+        
     plt.gca().set_ylabel('Average Endpoint Error (EPE)', fontsize=20)
     plt.gca().set_xlabel('Average Runtime (seconds per frame)', fontsize=20)
     plt.gca().set_xscale("log")

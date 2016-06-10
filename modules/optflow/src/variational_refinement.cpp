@@ -84,16 +84,29 @@ protected: // timings (temporary)
     void setGamma(float val) { gamma = val; }
 
   protected:                                         // internal buffers
+      struct RedBlackBuffer 
+      {
+          //special data layout (separate storage of "red" and black" elements),
+          //more SIMD-friendly and easier to parallelize
+          Mat_<float> red;   // (i+j)%2==0
+          Mat_<float> black; // (i+j)%2==1
+          void create(Size s);
+          void release();
+      };
     Mat_<float> Ix, Iy, Iz, Ixx, Ixy, Iyy, Ixz, Iyz; // image derivatives
-    Mat_<float> A11, A12, A22, b1, b2;               // linear system coefficients
-    Mat_<float> weights;                             // smoothness term weights in the current fixed point iteration
+    RedBlackBuffer Ix_rb, Iy_rb, Iz_rb, Ixx_rb, Ixy_rb, Iyy_rb, Ixz_rb, Iyz_rb;
+    RedBlackBuffer A11, A12, A22, b1, b2;               // linear system coefficients
+    RedBlackBuffer weights;                             // smoothness term weights in the current fixed point iteration
 
     Mat_<float> mapX, mapY; // auxiliary buffers for remapping
 
-    Mat_<float> tempW_u, tempW_v; // flow version that is modified in each fixed point iteration
-    Mat_<float> dW_u, dW_v;       // optical flow increment
+    RedBlackBuffer tempW_u, tempW_v; // flow version that is modified in each fixed point iteration
+    RedBlackBuffer dW_u, dW_v;       // optical flow increment
+    RedBlackBuffer W_u_rb, W_v_rb;   //split version of the input flow
 
   private: // private methods
+    void splitCheckerboard(RedBlackBuffer& dst, Mat& src);
+    void mergeCheckerboard(Mat& dst, RedBlackBuffer& src);
     void warpImage(Mat &dst, const Mat &src, const Mat &flow_u, const Mat &flow_v);
     void prepareBuffers(const Mat &I0, const Mat &I1, const Mat &W_u, const Mat &W_v);
     void computeDataTerm(const Mat &dW_u, const Mat &dW_v, int start_i, int end_i);
@@ -142,6 +155,93 @@ VariationalRefinementImpl::VariationalRefinementImpl()
     time_SOR = 0.0;
 }
 
+void VariationalRefinementImpl::splitCheckerboard(RedBlackBuffer& dst, Mat& src)
+{
+    //splits one buffer into two using a checkerboard pattern
+    //assumes that enough memory is already allocated
+    int buf_j,j;
+    for (int i = 0; i < src.rows; i++)
+    {
+        float *src_buf = src.ptr<float>(i);
+        float *r_buf = dst.red.ptr<float>(i);
+        float *b_buf = dst.black.ptr<float>(i);
+        buf_j = 0;
+        
+        if (i % 2 == 0)
+        {
+            for (j = 0; j < src.cols-1; j+=2)
+            {
+                r_buf[buf_j] = src_buf[j];
+                b_buf[buf_j] = src_buf[j+1];
+                buf_j++;
+            }
+            if(j<src.cols)
+                r_buf[buf_j] = src_buf[j];
+        }
+        else
+        {
+            for (j = 0; j < src.cols - 1; j += 2)
+            {
+                b_buf[buf_j] = src_buf[j];
+                r_buf[buf_j] = src_buf[j + 1];
+                buf_j++;
+            }
+            if (j<src.cols)
+                b_buf[buf_j] = src_buf[j];
+        }
+    }
+}
+
+void VariationalRefinementImpl::mergeCheckerboard(Mat& dst, RedBlackBuffer& src)
+{
+    //merge two buffers into one using a checkerboard pattern
+    //assumes that enough memory is already allocated
+    int buf_j, j;
+    for (int i = 0; i < dst.rows; i++)
+    {
+        float *src_r_buf = src.red.ptr<float>(i);
+        float *src_b_buf = src.black.ptr<float>(i);
+        float *dst_buf = dst.ptr<float>(i);
+        buf_j = 0;
+
+        if (i % 2 == 0)
+        {
+            for (j = 0; j < dst.cols - 1; j += 2)
+            {
+                dst_buf[j] = src_r_buf[buf_j];
+                dst_buf[j + 1] = src_b_buf[buf_j];
+                buf_j++;
+            }
+            if (j < dst.cols)
+                dst_buf[j] = src_r_buf[buf_j];
+        }
+        else
+        {
+            for (j = 0; j < dst.cols - 1; j += 2)
+            {
+                dst_buf[j] = src_b_buf[buf_j];
+                dst_buf[j + 1] = src_r_buf[buf_j];
+                buf_j++;
+            }
+            if (j < dst.cols)
+                dst_buf[j] = src_b_buf[buf_j];
+        }
+    }
+}
+
+void VariationalRefinementImpl::RedBlackBuffer::create(Size s)
+{
+    int w = (int)ceil(s.width / 2.0);
+    red.create(s.height, w);
+    black.create(s.height, w);
+}
+
+void VariationalRefinementImpl::RedBlackBuffer::release()
+{
+    red.release();
+    black.release();
+}
+
 void VariationalRefinementImpl::warpImage(Mat &dst, const Mat &src, const Mat &flow_u, const Mat &flow_v)
 {
     const float *pFlowU, *pFlowV;
@@ -174,6 +274,8 @@ void VariationalRefinementImpl::prepareBuffers(const Mat &I0, const Mat &I1, con
     tempW_v.create(s);
     dW_u.create(s);
     dW_v.create(s);
+    W_u_rb.create(s);
+    W_v_rb.create(s);
 
     mapX.create(s);
     mapY.create(s);
@@ -204,6 +306,16 @@ void VariationalRefinementImpl::prepareBuffers(const Mat &I0, const Mat &I1, con
     subtract(warpedI, I0, Iz, noArray(), CV_32F);
     Sobel(Iz, Ixz, -1, 1, 0, kernel_size, 1, 0.00, BORDER_REPLICATE);
     Sobel(Iz, Iyz, -1, 0, 1, kernel_size, 1, 0.00, BORDER_REPLICATE);
+
+    //splitting the derivative buffers:
+    Ix_rb.create(s); splitCheckerboard(Ix_rb, Ix);
+    Iy_rb.create(s); splitCheckerboard(Iy_rb, Iy);
+    Iz_rb.create(s); splitCheckerboard(Iz_rb, Iz);
+    Ixx_rb.create(s); splitCheckerboard(Ixx_rb, Ixx);
+    Ixy_rb.create(s); splitCheckerboard(Ixy_rb, Ixy);
+    Iyy_rb.create(s); splitCheckerboard(Iyy_rb, Iyy);
+    Ixz_rb.create(s); splitCheckerboard(Ixz_rb, Ixz);
+    Iyz_rb.create(s); splitCheckerboard(Iyz_rb, Iyz);
 }
 
 void VariationalRefinementImpl::computeDataTerm(const Mat &dW_u, const Mat &dW_v, int start_i, int end_i)
@@ -257,9 +369,9 @@ void VariationalRefinementImpl::computeDataTerm(const Mat &dW_u, const Mat &dW_v
             weight = delta2 / sqrt(Ik1z * Ik1z / derivNorm + epsilon_squared);
             // Add respective color constancy components to the linear sustem coefficients:
             // mult = weight / derivNorm;
-            *pa11 = weight * ((float)*pIx * *pIx / derivNorm) + zeta_squared;
+            *pa11 = weight * ((float)*pIx * *pIx / derivNorm) +zeta_squared;
             *pa12 = weight * ((float)*pIx * *pIy / derivNorm);
-            *pa22 = weight * ((float)*pIy * *pIy / derivNorm) + zeta_squared;
+            *pa22 = weight * ((float)*pIy * *pIy / derivNorm) +zeta_squared;
             *pb1 = -weight * ((float)*pIz * *pIx / derivNorm);
             *pb2 = -weight * ((float)*pIz * *pIy / derivNorm);
 
@@ -751,11 +863,16 @@ void VariationalRefinementImpl::calcUV(InputArray I0, InputArray I1, InputOutput
     Mat &W_v = flow_v.getMatRef();
     prepareBuffers(I0Mat, I1Mat, W_u, W_v);
 
-    W_u.copyTo(tempW_u);
-    W_v.copyTo(tempW_v);
-    dW_u.setTo(0.0f);
-    dW_v.setTo(0.0f);
-    int SOR_chunk_size = 10; // ideally, something that just fits into one cache line
+    splitCheckerboard(W_u_rb, W_u);
+    splitCheckerboard(W_v_rb, W_v);
+    W_u_rb.red.copyTo(tempW_u.red);
+    W_u_rb.black.copyTo(tempW_u.black);
+    W_v_rb.red.copyTo(tempW_v.red);
+    W_v_rb.black.copyTo(tempW_v.black);
+    dW_u.red.setTo(0.0f);
+    dW_u.black.setTo(0.0f);
+    dW_v.red.setTo(0.0f);
+    dW_v.black.setTo(0.0f);
     double  startTick, time;
     for (int i = 0; i < fixedPointIterations; i++)
     {

@@ -143,9 +143,9 @@ class DISOpticalFlowImpl : public DISOpticalFlow
 
 DISOpticalFlowImpl::DISOpticalFlowImpl()
 {
-    finest_scale = 0;
+    finest_scale = 1;
     patch_size = 8;
-    patch_stride = 4;
+    patch_stride = 3;
     grad_descent_iter = 12;
     num_stripes = getNumThreads();
     border_size = 16;
@@ -217,7 +217,7 @@ void DISOpticalFlowImpl::prepareBuffers(Mat &I0, Mat &I1)
             // Sobel(I0s[i], I0ys[i], CV_16S, 0, 1, 1);
             Ux[i].create(cur_rows, cur_cols);
             Uy[i].create(cur_rows, cur_cols);
-            variational_refinement_processors[i]->setFixedPointIterations(i + 1);
+            variational_refinement_processors[i]->setFixedPointIterations(5*i + 5);
         }
     }
 }

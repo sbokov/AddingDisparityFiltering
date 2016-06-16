@@ -40,8 +40,8 @@
 //
 //M*/
 
-#include "precomp.hpp"
 #include "opencv2/core/hal/intrin.hpp"
+#include "precomp.hpp"
 using namespace std;
 
 namespace cv
@@ -65,10 +65,6 @@ class VariationalRefinementImpl : public VariationalRefinement
     float zeta, epsilon;
     int num_stripes;
 
-protected: // timings (temporary)
-    double time_terms;
-    double time_SOR;
-
   public: // getters and setters
     int getFixedPointIterations() const { return fixedPointIterations; }
     void setFixedPointIterations(int val) { fixedPointIterations = val; }
@@ -83,59 +79,127 @@ protected: // timings (temporary)
     float getGamma() const { return gamma; }
     void setGamma(float val) { gamma = val; }
 
-  protected:                                         // internal buffers
-      struct RedBlackBuffer 
-      {
-          //special data layout (separate storage of "red" and black" elements),
-          //more SIMD-friendly and easier to parallelize
-          Mat_<float> red;   // (i+j)%2==0
-          Mat_<float> black; // (i+j)%2==1
-          void create(Size s);
-          void release();
-      };
+  protected: // internal buffers
+    struct RedBlackBuffer
+    {
+        // special data layout (separate storage of "red" and "black" elements),
+        // more SIMD-friendly and easier to parallelize
+        // uses padding to simplify border processing
+        Mat_<float> red;   // (i+j)%2==0
+        Mat_<float> black; // (i+j)%2==1
+
+        // can be different if width%2==1:
+        int red_even_len, red_odd_len;
+        int black_even_len, black_odd_len;
+
+        void create(Size s);
+        void release();
+    };
     Mat_<float> Ix, Iy, Iz, Ixx, Ixy, Iyy, Ixz, Iyz; // image derivatives
     RedBlackBuffer Ix_rb, Iy_rb, Iz_rb, Ixx_rb, Ixy_rb, Iyy_rb, Ixz_rb, Iyz_rb;
-    RedBlackBuffer A11, A12, A22, b1, b2;               // linear system coefficients
-    RedBlackBuffer weights;                             // smoothness term weights in the current fixed point iteration
+    RedBlackBuffer A11, A12, A22, b1, b2; // linear system coefficients
+    RedBlackBuffer weights;               // smoothness term weights in the current fixed point iteration
 
     Mat_<float> mapX, mapY; // auxiliary buffers for remapping
 
     RedBlackBuffer tempW_u, tempW_v; // flow version that is modified in each fixed point iteration
     RedBlackBuffer dW_u, dW_v;       // optical flow increment
-    RedBlackBuffer W_u_rb, W_v_rb;   //split version of the input flow
+    RedBlackBuffer W_u_rb, W_v_rb;   // split version of the input flow
 
   private: // private methods
-    void splitCheckerboard(RedBlackBuffer& dst, Mat& src);
-    void mergeCheckerboard(Mat& dst, RedBlackBuffer& src);
+    void splitCheckerboard(RedBlackBuffer &dst, Mat &src);
+    void mergeCheckerboard(Mat &dst, RedBlackBuffer &src);
+    void updateRepeatedBorders(RedBlackBuffer &dst);
     void warpImage(Mat &dst, const Mat &src, const Mat &flow_u, const Mat &flow_v);
     void prepareBuffers(const Mat &I0, const Mat &I1, const Mat &W_u, const Mat &W_v);
-    void computeDataTerm(const Mat &dW_u, const Mat &dW_v, int start_i, int end_i);
-    void computeSmoothnessTerm(const Mat &W_u, const Mat &W_v, const Mat &curW_u, const Mat &curW_v, int start_i,
-                               int end_i);
 
-    struct ComputeTerms_ParBody : public ParallelLoopBody
+    typedef void (VariationalRefinementImpl::*Op)(void* op1, void* op2, void* op3);
+
+    struct ParallelOp_ParBody : public ParallelLoopBody
+    {
+        VariationalRefinementImpl* var;
+        vector<Op> ops;
+        vector<void*> op1s;
+        vector<void*> op2s;
+        vector<void*> op3s;
+
+        ParallelOp_ParBody(VariationalRefinementImpl& _var, vector<Op> _ops, vector<void*>& _op1s, vector<void*>& _op2s, vector<void*>& _op3s);
+        void operator () (const Range& range) const;
+    };
+
+    void gradHorizAndSplitOp(void* src, void* dst, void* dst_split)
+    {
+        Sobel(*(Mat*)src, *(Mat*)dst, -1, 1, 0, 1, 1, 0.00, BORDER_REPLICATE);
+        splitCheckerboard(*(RedBlackBuffer*)dst_split, *(Mat*)dst);
+    }
+
+    void gradVertAndSplitOp(void* src, void* dst, void* dst_split)
+    {
+        Sobel(*(Mat*)src, *(Mat*)dst, -1, 0, 1, 1, 1, 0.00, BORDER_REPLICATE);
+        splitCheckerboard(*(RedBlackBuffer*)dst_split, *(Mat*)dst);
+    }
+
+    void averageOp(void* src1, void* src2, void* dst)
+    {
+        addWeighted(*(Mat*)src1, 0.5, *(Mat*)src2, 0.5, 0.0, *(Mat*)dst, CV_32F);
+    }
+
+    void subtractOp(void* src1, void* src2, void* dst)
+    {
+        subtract(*(Mat*)src1, *(Mat*)src2, *(Mat*)dst, noArray(), CV_32F);
+    }
+
+    struct ComputeDataTerm_ParBody : public ParallelLoopBody
     {
         VariationalRefinementImpl *var;
-        Mat *W_u, *W_v, *dW_u, *dW_v, *tempW_u, *tempW_v;
+        RedBlackBuffer *dW_u, *dW_v;
         int nstripes, stripe_sz;
         int h;
+        bool red_pass;
 
-        ComputeTerms_ParBody(VariationalRefinementImpl &_var, int _nstripes, int _h, Mat &W_u, Mat &_W_v, Mat &_dW_u,
-                             Mat &_dW_v, Mat &_tempW_u, Mat &_tempW_v);
+        ComputeDataTerm_ParBody(VariationalRefinementImpl &_var, int _nstripes, int _h, RedBlackBuffer &_dW_u,
+                                RedBlackBuffer &_dW_v, bool _red_pass);
+        void operator()(const Range &range) const;
+    };
+
+    struct ComputeSmoothnessTermHorPass_ParBody : public ParallelLoopBody
+    {
+        VariationalRefinementImpl *var;
+        RedBlackBuffer *W_u, *W_v, *curW_u, *curW_v;
+        int nstripes, stripe_sz;
+        int h;
+        bool red_pass;
+
+        ComputeSmoothnessTermHorPass_ParBody(VariationalRefinementImpl &_var, int _nstripes, int _h, RedBlackBuffer &W_u,
+                                             RedBlackBuffer &_W_v, RedBlackBuffer &_tempW_u, RedBlackBuffer &_tempW_v,
+                                             bool _red_pass);
+        void operator()(const Range &range) const;
+    };
+
+    struct ComputeSmoothnessTermVertPass_ParBody : public ParallelLoopBody
+    {
+        VariationalRefinementImpl *var;
+        RedBlackBuffer *W_u, *W_v;
+        int nstripes, stripe_sz;
+        int h;
+        bool red_pass;
+
+        ComputeSmoothnessTermVertPass_ParBody(VariationalRefinementImpl &_var, int _nstripes, int _h, RedBlackBuffer &W_u,
+            RedBlackBuffer &_W_v,
+            bool _red_pass);
         void operator()(const Range &range) const;
     };
 
     struct RedBlackSOR_ParBody : public ParallelLoopBody
     {
         VariationalRefinementImpl *var;
-        bool is_red;  // red of black pass
-        int chunk_sz; // size of contiguous chunks of memory of the same color (for better data locality)
+        RedBlackBuffer *dW_u, *dW_v;
         int nstripes, stripe_sz;
         int h;
-        Mat *dW_u, *dW_v;
+        bool red_pass; // red of black pass
 
-        RedBlackSOR_ParBody(VariationalRefinementImpl &_var, bool is_red_pass, int _chunk_sz, int _nstripes, int _h,
-                            Mat &_dW_u, Mat &_dW_v);
+        RedBlackSOR_ParBody(VariationalRefinementImpl &_var, int _nstripes, int _h, RedBlackBuffer &_dW_u,
+                            RedBlackBuffer &_dW_v, bool _red_pass);
         void operator()(const Range &range) const;
     };
 };
@@ -151,32 +215,36 @@ VariationalRefinementImpl::VariationalRefinementImpl()
     zeta = 0.1f;
     epsilon = 0.001f;
     num_stripes = getNumThreads();
-    time_terms = 0.0;
-    time_SOR = 0.0;
 }
 
-void VariationalRefinementImpl::splitCheckerboard(RedBlackBuffer& dst, Mat& src)
+/////////////////// RedBlackBuffer auxiliary functions ///////////////////
+
+void VariationalRefinementImpl::splitCheckerboard(RedBlackBuffer &dst, Mat &src)
 {
-    //splits one buffer into two using a checkerboard pattern
-    //assumes that enough memory is already allocated
-    int buf_j,j;
+    // splits one buffer into two using a checkerboard pattern
+    // assumes that enough memory is already allocated
+    // adds repeated-border padding
+    int buf_j, j;
+    int buf_w = (int)ceil(src.cols / 2.0) + 2;
     for (int i = 0; i < src.rows; i++)
     {
         float *src_buf = src.ptr<float>(i);
-        float *r_buf = dst.red.ptr<float>(i);
-        float *b_buf = dst.black.ptr<float>(i);
-        buf_j = 0;
-        
+        float *r_buf = dst.red.ptr<float>(i + 1);
+        float *b_buf = dst.black.ptr<float>(i + 1);
+        buf_j = 1;
+        r_buf[0] = b_buf[0] = src_buf[0];
         if (i % 2 == 0)
         {
-            for (j = 0; j < src.cols-1; j+=2)
+            for (j = 0; j < src.cols - 1; j += 2)
             {
                 r_buf[buf_j] = src_buf[j];
-                b_buf[buf_j] = src_buf[j+1];
+                b_buf[buf_j] = src_buf[j + 1];
                 buf_j++;
             }
-            if(j<src.cols)
-                r_buf[buf_j] = src_buf[j];
+            if (j < src.cols)
+                r_buf[buf_j] = b_buf[buf_j] = src_buf[j];
+            else
+                j--;
         }
         else
         {
@@ -186,23 +254,42 @@ void VariationalRefinementImpl::splitCheckerboard(RedBlackBuffer& dst, Mat& src)
                 r_buf[buf_j] = src_buf[j + 1];
                 buf_j++;
             }
-            if (j<src.cols)
-                b_buf[buf_j] = src_buf[j];
+            if (j < src.cols)
+                r_buf[buf_j] = b_buf[buf_j] = src_buf[j];
+            else
+                j--;
         }
+        r_buf[buf_w - 1] = b_buf[buf_w - 1] = src_buf[j];
+    }
+    {
+        float *r_buf_border = dst.red.ptr<float>(dst.red.rows - 1);
+        float *b_buf_border = dst.black.ptr<float>(dst.black.rows - 1);
+        float *r_buf = dst.red.ptr<float>(dst.red.rows - 2);
+        float *b_buf = dst.black.ptr<float>(dst.black.rows - 2);
+        memcpy(r_buf_border, b_buf, buf_w * sizeof(float));
+        memcpy(b_buf_border, r_buf, buf_w * sizeof(float));
+    }
+    {
+        float *r_buf_border = dst.red.ptr<float>(0);
+        float *b_buf_border = dst.black.ptr<float>(0);
+        float *r_buf = dst.red.ptr<float>(1);
+        float *b_buf = dst.black.ptr<float>(1);
+        memcpy(r_buf_border, b_buf, buf_w * sizeof(float));
+        memcpy(b_buf_border, r_buf, buf_w * sizeof(float));
     }
 }
 
-void VariationalRefinementImpl::mergeCheckerboard(Mat& dst, RedBlackBuffer& src)
+void VariationalRefinementImpl::mergeCheckerboard(Mat &dst, RedBlackBuffer &src)
 {
-    //merge two buffers into one using a checkerboard pattern
-    //assumes that enough memory is already allocated
+    // merge two buffers into one using a checkerboard pattern
+    // assumes that enough memory is already allocated
     int buf_j, j;
     for (int i = 0; i < dst.rows; i++)
     {
-        float *src_r_buf = src.red.ptr<float>(i);
-        float *src_b_buf = src.black.ptr<float>(i);
+        float *src_r_buf = src.red.ptr<float>(i + 1);
+        float *src_b_buf = src.black.ptr<float>(i + 1);
         float *dst_buf = dst.ptr<float>(i);
-        buf_j = 0;
+        buf_j = 1;
 
         if (i % 2 == 0)
         {
@@ -229,17 +316,81 @@ void VariationalRefinementImpl::mergeCheckerboard(Mat& dst, RedBlackBuffer& src)
     }
 }
 
+void VariationalRefinementImpl::updateRepeatedBorders(RedBlackBuffer &dst)
+{
+    int buf_w = dst.red.cols;
+    for (int i = 0; i < dst.red.rows - 2; i++)
+    {
+        float *r_buf = dst.red.ptr<float>(i + 1);
+        float *b_buf = dst.black.ptr<float>(i + 1);
+
+        if (i % 2 == 0)
+        {
+            b_buf[0] = r_buf[1];
+            if (dst.red_even_len > dst.black_even_len)
+                b_buf[dst.black_even_len + 1] = r_buf[dst.red_even_len];
+            else
+                r_buf[dst.red_even_len + 1] = b_buf[dst.black_even_len];
+        }
+        else
+        {
+            r_buf[0] = b_buf[1];
+            if (dst.red_odd_len < dst.black_odd_len)
+                r_buf[dst.red_odd_len + 1] = b_buf[dst.black_odd_len];
+            else
+                b_buf[dst.black_odd_len + 1] = r_buf[dst.red_odd_len];
+        }
+    }
+
+    {
+        float *r_buf_border = dst.red.ptr<float>(dst.red.rows - 1);
+        float *b_buf_border = dst.black.ptr<float>(dst.black.rows - 1);
+        float *r_buf = dst.red.ptr<float>(dst.red.rows - 2);
+        float *b_buf = dst.black.ptr<float>(dst.black.rows - 2);
+        memcpy(r_buf_border, b_buf, buf_w * sizeof(float));
+        memcpy(b_buf_border, r_buf, buf_w * sizeof(float));
+    }
+    {
+        float *r_buf_border = dst.red.ptr<float>(0);
+        float *b_buf_border = dst.black.ptr<float>(0);
+        float *r_buf = dst.red.ptr<float>(1);
+        float *b_buf = dst.black.ptr<float>(1);
+        memcpy(r_buf_border, b_buf, buf_w * sizeof(float));
+        memcpy(b_buf_border, r_buf, buf_w * sizeof(float));
+    }
+}
+
 void VariationalRefinementImpl::RedBlackBuffer::create(Size s)
 {
-    int w = (int)ceil(s.width / 2.0);
-    red.create(s.height, w);
-    black.create(s.height, w);
+    int w = (int)ceil(s.width / 2.0) + 2;
+    red.create(s.height + 2, w);
+    black.create(s.height + 2, w);
+
+    if (s.width % 2 == 0)
+        red_even_len = red_odd_len = black_even_len = black_odd_len = w - 2;
+    else
+    {
+        red_even_len = black_odd_len = w - 2;
+        red_odd_len = black_even_len = w - 3;
+    }
 }
 
 void VariationalRefinementImpl::RedBlackBuffer::release()
 {
     red.release();
     black.release();
+}
+
+//////////////////////////////////////////////////////////////////////////
+
+VariationalRefinementImpl::ParallelOp_ParBody::ParallelOp_ParBody(VariationalRefinementImpl& _var, vector<Op> _ops, vector<void*>& _op1s, vector<void*>& _op2s, vector<void*>& _op3s):
+    var(&_var), ops(_ops), op1s(_op1s), op2s(_op2s), op3s(_op3s)
+{}
+
+void VariationalRefinementImpl::ParallelOp_ParBody::operator() (const Range& range) const
+{
+    for (int i = range.start; i<range.end; i++)
+        (var->*ops[i])(op1s[i], op2s[i], op3s[i]);
 }
 
 void VariationalRefinementImpl::warpImage(Mat &dst, const Mat &src, const Mat &flow_u, const Mat &flow_v)
@@ -263,6 +414,7 @@ void VariationalRefinementImpl::warpImage(Mat &dst, const Mat &src, const Mat &f
 
 void VariationalRefinementImpl::prepareBuffers(const Mat &I0, const Mat &I1, const Mat &W_u, const Mat &W_v)
 {
+    double startTick, time;
     Size s = I0.size();
     A11.create(s);
     A12.create(s);
@@ -270,18 +422,14 @@ void VariationalRefinementImpl::prepareBuffers(const Mat &I0, const Mat &I1, con
     b1.create(s);
     b2.create(s);
     weights.create(s);
+    weights.red.setTo(0.0f);
+    weights.black.setTo(0.0f);
     tempW_u.create(s);
     tempW_v.create(s);
     dW_u.create(s);
     dW_v.create(s);
     W_u_rb.create(s);
     W_v_rb.create(s);
-
-    mapX.create(s);
-    mapY.create(s);
-    Mat I1flt, warpedI;
-    I1.convertTo(I1flt, CV_32F); // works slightly better with floating-point warps
-    warpImage(warpedI, I1flt, W_u, W_v);
 
     Ix.create(s);
     Iy.create(s);
@@ -292,43 +440,83 @@ void VariationalRefinementImpl::prepareBuffers(const Mat &I0, const Mat &I1, con
     Ixz.create(s);
     Iyz.create(s);
 
+    Ix_rb.create(s);
+    Iy_rb.create(s);
+    Iz_rb.create(s);
+    Ixx_rb.create(s);
+    Ixy_rb.create(s);
+    Iyy_rb.create(s);
+    Ixz_rb.create(s);
+    Iyz_rb.create(s);
+
+    mapX.create(s);
+    mapY.create(s);
+    
+    Mat I1flt, warpedI;
+    I1.convertTo(I1flt, CV_32F); // works slightly better with floating-point warps
+    warpImage(warpedI, I1flt, W_u, W_v);
+
     // computing derivatives on the average of the current and warped next frame:
-    int kernel_size = 1;
     Mat averagedI;
-    addWeighted(I0, 0.5, warpedI, 0.5, 0.0, averagedI, CV_32F);
-    Sobel(averagedI, Ix, -1, 1, 0, kernel_size, 1, 0.00, BORDER_REPLICATE);
-    Sobel(averagedI, Iy, -1, 0, 1, kernel_size, 1, 0.00, BORDER_REPLICATE);
-    Sobel(Ix, Ixx, -1, 1, 0, kernel_size, 1, 0.00, BORDER_REPLICATE);
-    Sobel(Ix, Ixy, -1, 0, 1, kernel_size, 1, 0.00, BORDER_REPLICATE);
-    Sobel(Iy, Iyy, -1, 0, 1, kernel_size, 1, 0.00, BORDER_REPLICATE);
 
-    // computing temporal derivatives (along the flow):
-    subtract(warpedI, I0, Iz, noArray(), CV_32F);
-    Sobel(Iz, Ixz, -1, 1, 0, kernel_size, 1, 0.00, BORDER_REPLICATE);
-    Sobel(Iz, Iyz, -1, 0, 1, kernel_size, 1, 0.00, BORDER_REPLICATE);
+    {
+        vector<void*> op1s; op1s.push_back((void*)&I0); op1s.push_back((void*)&warpedI);
+        vector<void*> op2s; op2s.push_back((void*)&warpedI); op2s.push_back((void*)&I0);
+        vector<void*> op3s; op3s.push_back((void*)&averagedI); op3s.push_back((void*)&Iz);
+        vector<Op> ops; ops.push_back(&VariationalRefinementImpl::averageOp); ops.push_back(&VariationalRefinementImpl::subtractOp);
+        parallel_for_(Range(0, 2), ParallelOp_ParBody(*this, ops, op1s, op2s, op3s));
+    }
 
-    //splitting the derivative buffers:
-    Ix_rb.create(s); splitCheckerboard(Ix_rb, Ix);
-    Iy_rb.create(s); splitCheckerboard(Iy_rb, Iy);
-    Iz_rb.create(s); splitCheckerboard(Iz_rb, Iz);
-    Ixx_rb.create(s); splitCheckerboard(Ixx_rb, Ixx);
-    Ixy_rb.create(s); splitCheckerboard(Ixy_rb, Ixy);
-    Iyy_rb.create(s); splitCheckerboard(Iyy_rb, Iyy);
-    Ixz_rb.create(s); splitCheckerboard(Ixz_rb, Ixz);
-    Iyz_rb.create(s); splitCheckerboard(Iyz_rb, Iyz);
+    splitCheckerboard(Iz_rb, Iz);
+
+    {
+        vector<void*> op1s; op1s.push_back((void*)&averagedI); op1s.push_back((void*)&averagedI);
+        op1s.push_back((void*)&Iz); op1s.push_back((void*)&Iz);
+        vector<void*> op2s; op2s.push_back((void*)&Ix); op2s.push_back((void*)&Iy);
+        op2s.push_back((void*)&Ixz); op2s.push_back((void*)&Iyz);
+        vector<void*> op3s; op3s.push_back((void*)&Ix_rb); op3s.push_back((void*)&Iy_rb);
+        op3s.push_back((void*)&Ixz_rb); op3s.push_back((void*)&Iyz_rb);
+        vector<Op> ops; ops.push_back(&VariationalRefinementImpl::gradHorizAndSplitOp); ops.push_back(&VariationalRefinementImpl::gradVertAndSplitOp);
+        ops.push_back(&VariationalRefinementImpl::gradHorizAndSplitOp); ops.push_back(&VariationalRefinementImpl::gradVertAndSplitOp);
+        parallel_for_(Range(0, 4), ParallelOp_ParBody(*this, ops, op1s, op2s, op3s));
+    }
+
+    {
+        vector<void*> op1s; op1s.push_back((void*)&Ix); op1s.push_back((void*)&Ix);
+        op1s.push_back((void*)&Iy);
+        vector<void*> op2s; op2s.push_back((void*)&Ixx); op2s.push_back((void*)&Ixy);
+        op2s.push_back((void*)&Iyy);
+        vector<void*> op3s; op3s.push_back((void*)&Ixx_rb); op3s.push_back((void*)&Ixy_rb);
+        op3s.push_back((void*)&Iyy_rb);
+        vector<Op> ops; ops.push_back(&VariationalRefinementImpl::gradHorizAndSplitOp); ops.push_back(&VariationalRefinementImpl::gradVertAndSplitOp);
+        ops.push_back(&VariationalRefinementImpl::gradVertAndSplitOp);
+        parallel_for_(Range(0, 3), ParallelOp_ParBody(*this, ops, op1s, op2s, op3s));
+    }
 }
 
-void VariationalRefinementImpl::computeDataTerm(const Mat &dW_u, const Mat &dW_v, int start_i, int end_i)
+VariationalRefinementImpl::ComputeDataTerm_ParBody::ComputeDataTerm_ParBody(VariationalRefinementImpl &_var,
+                                                                            int _nstripes, int _h,
+                                                                            RedBlackBuffer &_dW_u,
+                                                                            RedBlackBuffer &_dW_v, bool _red_pass)
+    : var(&_var), nstripes(_nstripes), h(_h), dW_u(&_dW_u), dW_v(&_dW_v), red_pass(_red_pass)
+{
+    stripe_sz = (int)ceil(h / (double)nstripes);
+}
+
+void VariationalRefinementImpl::ComputeDataTerm_ParBody::operator()(const Range &range) const
 {
     /*Using robust data term based on color and gradient constancy assumptions*/
 
     /*In this function we compute linear system coefficients
-      A11,A12,A22,b1,b1 based on the data term */
+    A11,A12,A22,b1,b1 based on the data term */
 
-    const float zeta_squared = zeta * zeta;
-    const float epsilon_squared = epsilon * epsilon;
-    const float gamma2 = gamma / 2;
-    const float delta2 = delta / 2;
+    int start_i = min(range.start * stripe_sz, h);
+    int end_i = min(range.end * stripe_sz, h);
+
+    const float zeta_squared = var->zeta * var->zeta;
+    const float epsilon_squared = var->epsilon * var->epsilon;
+    const float gamma2 = var->gamma / 2;
+    const float delta2 = var->delta / 2;
 
     const float *pIx, *pIy, *pIz;
     const float *pIxx, *pIxy, *pIyy, *pIxz, *pIyz;
@@ -336,500 +524,607 @@ void VariationalRefinementImpl::computeDataTerm(const Mat &dW_u, const Mat &dW_v
     float *pa11, *pa12, *pa22, *pb1, *pb2;
 
     float derivNorm, derivNorm2;
-    float mult, mult2;
     float Ik1z, Ik1zx, Ik1zy;
     float weight;
+    int len;
     for (int i = start_i; i < end_i; i++)
     {
-        pIx = Ix.ptr<float>(i);
-        pIy = Iy.ptr<float>(i);
-        pIz = Iz.ptr<float>(i);
-        pIxx = Ixx.ptr<float>(i);
-        pIxy = Ixy.ptr<float>(i);
-        pIyy = Iyy.ptr<float>(i);
-        pIxz = Ixz.ptr<float>(i);
-        pIyz = Iyz.ptr<float>(i);
+        if (red_pass)
+        {
+            pIx = var->Ix_rb.red.ptr<float>(i + 1) + 1;
+            pIy = var->Iy_rb.red.ptr<float>(i + 1) + 1;
+            pIz = var->Iz_rb.red.ptr<float>(i + 1) + 1;
+            pIxx = var->Ixx_rb.red.ptr<float>(i + 1) + 1;
+            pIxy = var->Ixy_rb.red.ptr<float>(i + 1) + 1;
+            pIyy = var->Iyy_rb.red.ptr<float>(i + 1) + 1;
+            pIxz = var->Ixz_rb.red.ptr<float>(i + 1) + 1;
+            pIyz = var->Iyz_rb.red.ptr<float>(i + 1) + 1;
+            pa11 = var->A11.red.ptr<float>(i + 1) + 1;
+            pa12 = var->A12.red.ptr<float>(i + 1) + 1;
+            pa22 = var->A22.red.ptr<float>(i + 1) + 1;
+            pb1 = var->b1.red.ptr<float>(i + 1) + 1;
+            pb2 = var->b2.red.ptr<float>(i + 1) + 1;
+            pdU = dW_u->red.ptr<float>(i + 1) + 1;
+            pdV = dW_v->red.ptr<float>(i + 1) + 1;
+            if (i % 2 == 0)
+                len = var->Ix_rb.red_even_len;
+            else
+                len = var->Ix_rb.red_odd_len;
+        }
+        else
+        {
+            pIx = var->Ix_rb.black.ptr<float>(i + 1) + 1;
+            pIy = var->Iy_rb.black.ptr<float>(i + 1) + 1;
+            pIz = var->Iz_rb.black.ptr<float>(i + 1) + 1;
+            pIxx = var->Ixx_rb.black.ptr<float>(i + 1) + 1;
+            pIxy = var->Ixy_rb.black.ptr<float>(i + 1) + 1;
+            pIyy = var->Iyy_rb.black.ptr<float>(i + 1) + 1;
+            pIxz = var->Ixz_rb.black.ptr<float>(i + 1) + 1;
+            pIyz = var->Iyz_rb.black.ptr<float>(i + 1) + 1;
+            pa11 = var->A11.black.ptr<float>(i + 1) + 1;
+            pa12 = var->A12.black.ptr<float>(i + 1) + 1;
+            pa22 = var->A22.black.ptr<float>(i + 1) + 1;
+            pb1 = var->b1.black.ptr<float>(i + 1) + 1;
+            pb2 = var->b2.black.ptr<float>(i + 1) + 1;
+            pdU = dW_u->black.ptr<float>(i + 1) + 1;
+            pdV = dW_v->black.ptr<float>(i + 1) + 1;
+            if (i % 2 == 0)
+                len = var->Ix_rb.black_even_len;
+            else
+                len = var->Ix_rb.black_odd_len;
+        }
+        int j = 0;
+#ifdef CV_SIMD128
+        v_float32x4 zeta_vec = v_setall_f32(zeta_squared);
+        v_float32x4 eps_vec = v_setall_f32(epsilon_squared);
+        v_float32x4 delta_vec = v_setall_f32(delta2);
+        v_float32x4 gamma_vec = v_setall_f32(gamma2);
+        v_float32x4 zero_vec = v_setall_f32(0.0f);
+        v_float32x4 pIx_vec, pIy_vec, pIz_vec, pdU_vec, pdV_vec;
+        v_float32x4 pIxx_vec, pIxy_vec, pIyy_vec, pIxz_vec, pIyz_vec;
+        v_float32x4 derivNorm_vec, derivNorm2_vec, weight_vec;
+        v_float32x4 Ik1z_vec, Ik1zx_vec, Ik1zy_vec;
+        v_float32x4 pa11_vec, pa12_vec, pa22_vec, pb1_vec, pb2_vec;
 
-        pa11 = A11.ptr<float>(i);
-        pa12 = A12.ptr<float>(i);
-        pa22 = A22.ptr<float>(i);
-        pb1 = b1.ptr<float>(i);
-        pb2 = b2.ptr<float>(i);
+        for (; j < len - 3; j+=4)
+        {
+            pIx_vec = v_load(pIx + j);
+            pIy_vec = v_load(pIy + j);
+            pIz_vec = v_load(pIz + j);
+            pdU_vec = v_load(pdU + j);
+            pdV_vec = v_load(pdV + j);
 
-        pdU = dW_u.ptr<float>(i);
-        pdV = dW_v.ptr<float>(i);
-        for (int j = 0; j < dW_u.cols; j++)
+            derivNorm_vec = pIx_vec*pIx_vec + pIy_vec*pIy_vec + zeta_vec;
+            Ik1z_vec = pIz_vec + pIx_vec*pdU_vec + pIy_vec*pdV_vec;
+            weight_vec = delta_vec / v_sqrt(Ik1z_vec*Ik1z_vec / derivNorm_vec + eps_vec);
+
+            pa11_vec = weight_vec * (pIx_vec*pIx_vec / derivNorm_vec) + zeta_vec;
+            pa12_vec = weight_vec * (pIx_vec*pIy_vec / derivNorm_vec);
+            pa22_vec = weight_vec * (pIy_vec*pIy_vec / derivNorm_vec) + zeta_vec;
+            pb1_vec = zero_vec-weight_vec * (pIz_vec*pIx_vec / derivNorm_vec);
+            pb2_vec = zero_vec -weight_vec * (pIz_vec*pIy_vec / derivNorm_vec);
+
+            pIxx_vec = v_load(pIxx + j);
+            pIxy_vec = v_load(pIxy + j);
+            pIyy_vec = v_load(pIyy + j);
+            pIxz_vec = v_load(pIxz + j);
+            pIyz_vec = v_load(pIyz + j);
+
+            derivNorm_vec = pIxx_vec * pIxx_vec + pIxy_vec * pIxy_vec + zeta_vec;
+            derivNorm2_vec = pIyy_vec * pIyy_vec + pIxy_vec * pIxy_vec + zeta_vec;
+            Ik1zx_vec = pIxz_vec + pIxx_vec * pdU_vec + pIxy_vec * pdV_vec;
+            Ik1zy_vec = pIyz_vec + pIxy_vec * pdU_vec + pIyy_vec * pdV_vec;
+            weight_vec = gamma_vec / v_sqrt(Ik1zx_vec * Ik1zx_vec / derivNorm_vec + Ik1zy_vec * Ik1zy_vec / derivNorm2_vec + eps_vec);
+
+            pa11_vec += weight_vec * (pIxx_vec * pIxx_vec / derivNorm_vec + pIxy_vec * pIxy_vec / derivNorm2_vec);
+            pa12_vec += weight_vec * (pIxx_vec * pIxy_vec / derivNorm_vec + pIxy_vec * pIyy_vec / derivNorm2_vec);
+            pa22_vec += weight_vec * (pIxy_vec * pIxy_vec / derivNorm_vec + pIyy_vec * pIyy_vec / derivNorm2_vec);
+            pb1_vec -= weight_vec * (pIxx_vec * pIxz_vec / derivNorm_vec + pIxy_vec * pIyz_vec / derivNorm2_vec);
+            pb2_vec -= weight_vec * (pIxy_vec * pIxz_vec / derivNorm_vec + pIyy_vec * pIyz_vec / derivNorm2_vec);
+
+            v_store(pa11 + j, pa11_vec);
+            v_store(pa12 + j, pa12_vec);
+            v_store(pa22 + j, pa22_vec);
+            v_store(pb1 + j, pb1_vec);
+            v_store(pb2 + j, pb2_vec);
+        }
+#endif
+        for (; j < len; j++)
         {
             // Step 1: color contancy
             // Normalization factor:
-            derivNorm = (float)*pIx * (*pIx) + (*pIy) * (*pIy) + zeta_squared;
+            derivNorm = pIx[j] * pIx[j] + pIy[j] * pIy[j] + zeta_squared;
             // Color constancy penalty (computed by Taylor expansion):
-            Ik1z = *pIz + (*pIx * *pdU) + (*pIy * *pdV);
+            Ik1z = pIz[j] + pIx[j] * pdU[j] + pIy[j] * pdV[j];
             // Weight of the color constancy term in the current fixed-point iteration:
             weight = delta2 / sqrt(Ik1z * Ik1z / derivNorm + epsilon_squared);
             // Add respective color constancy components to the linear sustem coefficients:
-            // mult = weight / derivNorm;
-            *pa11 = weight * ((float)*pIx * *pIx / derivNorm) +zeta_squared;
-            *pa12 = weight * ((float)*pIx * *pIy / derivNorm);
-            *pa22 = weight * ((float)*pIy * *pIy / derivNorm) +zeta_squared;
-            *pb1 = -weight * ((float)*pIz * *pIx / derivNorm);
-            *pb2 = -weight * ((float)*pIz * *pIy / derivNorm);
+            pa11[j] = weight * (pIx[j] * pIx[j] / derivNorm) + zeta_squared;
+            pa12[j] = weight * (pIx[j] * pIy[j] / derivNorm);
+            pa22[j] = weight * (pIy[j] * pIy[j] / derivNorm) + zeta_squared;
+            pb1[j] = -weight * (pIz[j] * pIx[j] / derivNorm);
+            pb2[j] = -weight * (pIz[j] * pIy[j] / derivNorm);
 
             // Step 2: gradient contancy
             // Normalization factor for x gradient:
-            derivNorm = (float)(*pIxx) * *pIxx + *pIxy * *pIxy + zeta_squared;
+            derivNorm = pIxx[j] * pIxx[j] + pIxy[j] * pIxy[j] + zeta_squared;
             // Normalization factor for y gradient:
-            derivNorm2 = (float)(*pIyy) * *pIyy + *pIxy * *pIxy + zeta_squared;
+            derivNorm2 = pIyy[j] * pIyy[j] + pIxy[j] * pIxy[j] + zeta_squared;
             // Gradient constancy penalties (computed by Taylor expansion):
-            Ik1zx = *pIxz + *pIxx * *pdU + *pIxy * *pdV;
-            Ik1zy = *pIyz + *pIxy * *pdU + *pIyy * *pdV;
+            Ik1zx = pIxz[j] + pIxx[j] * pdU[j] + pIxy[j] * pdV[j];
+            Ik1zy = pIyz[j] + pIxy[j] * pdU[j] + pIyy[j] * pdV[j];
 
             // Weight of the gradient constancy term in the current fixed-point iteration:
             weight = gamma2 / sqrt(Ik1zx * Ik1zx / derivNorm + Ik1zy * Ik1zy / derivNorm2 + epsilon_squared);
             // Add respective gradient constancy components to the linear system coefficients:
-            mult = weight / derivNorm;
-            mult2 = weight / derivNorm2;
-            *pa11 += weight * ((float)*pIxx * *pIxx / derivNorm + (float)*pIxy * *pIxy / derivNorm2);
-            *pa12 += weight * ((float)*pIxx * *pIxy / derivNorm + (float)*pIxy * *pIyy / derivNorm2);
-            *pa22 += weight * ((float)*pIxy * *pIxy / derivNorm + (float)*pIyy * *pIyy / derivNorm2);
-            *pb1 += -weight * ((float)*pIxx * *pIxz / derivNorm + (float)*pIxy * *pIyz / derivNorm2);
-            *pb2 += -weight * ((float)*pIxy * *pIxz / derivNorm + (float)*pIyy * *pIyz / derivNorm2);
-
-            pIx++;
-            pIy++;
-            pIz++;
-            pIxx++;
-            pIxy++;
-            pIyy++;
-            pIxz++;
-            pIyz++;
-            pdU++;
-            pdV++;
-            pa11++;
-            pa12++;
-            pa22++;
-            pb1++;
-            pb2++;
+            pa11[j] += weight * (pIxx[j] * pIxx[j] / derivNorm + pIxy[j] * pIxy[j] / derivNorm2);
+            pa12[j] += weight * (pIxx[j] * pIxy[j] / derivNorm + pIxy[j] * pIyy[j] / derivNorm2);
+            pa22[j] += weight * (pIxy[j] * pIxy[j] / derivNorm + pIyy[j] * pIyy[j] / derivNorm2);
+            pb1[j] += -weight * (pIxx[j] * pIxz[j] / derivNorm + pIxy[j] * pIyz[j] / derivNorm2);
+            pb2[j] += -weight * (pIxy[j] * pIxz[j] / derivNorm + pIyy[j] * pIyz[j] / derivNorm2);
         }
     }
 }
 
-void VariationalRefinementImpl::computeSmoothnessTerm(const Mat &W_u, const Mat &W_v, const Mat &curW_u,
-                                                      const Mat &curW_v, int start_i, int end_i)
+VariationalRefinementImpl::ComputeSmoothnessTermHorPass_ParBody::ComputeSmoothnessTermHorPass_ParBody(
+  VariationalRefinementImpl &_var, int _nstripes, int _h, RedBlackBuffer &_W_u, RedBlackBuffer &_W_v,
+  RedBlackBuffer &_tempW_u, RedBlackBuffer &_tempW_v, bool _red_pass)
+    : var(&_var), nstripes(_nstripes), h(_h), W_u(&_W_u), W_v(&_W_v), curW_u(&_tempW_u), curW_v(&_tempW_v),
+      red_pass(_red_pass)
+{
+    stripe_sz = (int)ceil(h / (double)nstripes);
+}
+
+void VariationalRefinementImpl::ComputeSmoothnessTermHorPass_ParBody::operator()(const Range &range) const
 {
     /*Using robust penalty on flow gradient*/
 
     /*In this function we update b1, b2, A11, A22 coefficients of the linear system
-      and compute smoothness term weights for the current fixed-point iteration */
+    and compute smoothness term weights for the current fixed-point iteration */
 
-    const float epsilon_squared = epsilon * epsilon;
-    const float alpha2 = alpha / 2;
-    float *pW, *pB1, *pB2, *pB1_next, *pB2_next, *pA11, *pA22, *pA11_next, *pA22_next;
-    const float *cW_u, *cW_v, *cW_u_next, *cW_v_next;
-    const float *pW_u, *pW_v, *pW_u_next, *pW_v_next;
-    float ux, uy, vx, vy, iB1, iB2;
+    int start_i = min(range.start * stripe_sz, h);
+    int end_i = min(range.end * stripe_sz, h);
 
-#define PROC_ALL(cW_u, cW_v, pW_u, pW_v, cW_u_next, cW_v_next, pW_u_next, pW_v_next)                                   \
-    /*gradients for the flow on the current fixed-point iteration:*/                                                   \
-    ux = *(cW_u + 1) - *cW_u;                                                                                          \
-    vx = *(cW_v + 1) - *cW_v;                                                                                          \
-    uy = *cW_u_next - *cW_u;                                                                                           \
-    vy = *cW_v_next - *cW_v;                                                                                           \
-    /* weight of the smoothness term in the current fixed-point iteration:*/                                           \
-    *pW = alpha2 / sqrt(ux * ux + vx * vx + uy * uy + vy * vy + epsilon_squared);                                      \
-    /* gradients for initial raw flow multiplied by weight:*/                                                          \
-    ux = *pW * (*(pW_u + 1) - *pW_u);                                                                                  \
-    vx = *pW * (*(pW_v + 1) - *pW_v);                                                                                  \
-    uy = *pW * (*pW_u_next - *pW_u);                                                                                   \
-    vy = *pW * (*pW_v_next - *pW_v);
-
-#define PROC_VERT(cW_u, cW_v, pW_u, pW_v, cW_u_next, cW_v_next, pW_u_next, pW_v_next)                                  \
-    /*process only vertical gradients*/                                                                                \
-    uy = *cW_u_next - *cW_u;                                                                                           \
-    vy = *cW_v_next - *cW_v;                                                                                           \
-    *pW = alpha2 / sqrt(uy * uy + vy * vy + epsilon_squared);                                                          \
-    uy = *pW * (*pW_u_next - *pW_u);                                                                                   \
-    vy = *pW * (*pW_v_next - *pW_v);
-
-#define PROC_HORIZ(cW_u, cW_v, pW_u, pW_v)                                                                             \
-    /*process only horizontal gradients*/                                                                              \
-    ux = *(cW_u + 1) - *cW_u;                                                                                          \
-    vx = *(cW_v + 1) - *cW_v;                                                                                          \
-    *pW = alpha2 / sqrt(ux * ux + vx * vx + epsilon_squared);                                                          \
-    ux = *pW * (*(pW_u + 1) - *pW_u);                                                                                  \
-    vx = *pW * (*(pW_v + 1) - *pW_v);
-
-#define INC_CUR                                                                                                        \
-    pW++;                                                                                                              \
-    cW_u++;                                                                                                            \
-    cW_v++;                                                                                                            \
-    pW_u++;                                                                                                            \
-    pW_v++;                                                                                                            \
-    pB1++;                                                                                                             \
-    pB2++;                                                                                                             \
-    pA11++;                                                                                                            \
-    pA22++;
-
-#define INC_NEXT                                                                                                       \
-    cW_u_next++;                                                                                                       \
-    cW_v_next++;                                                                                                       \
-    pW_u_next++;                                                                                                       \
-    pW_v_next++;                                                                                                       \
-    pB1_next++;                                                                                                        \
-    pB2_next++;                                                                                                        \
-    pA11_next++;                                                                                                       \
-    pA22_next++;
-
-#define UPDATE_HORIZ_CUR                                                                                               \
-    *pB1 += ux;                                                                                                        \
-    *pA11 += *pW;                                                                                                      \
-    *pB2 += vx;                                                                                                        \
-    *pA22 += *pW;
-
-#define UPDATE_HORIZ_NEXT                                                                                              \
-    *(pB1 + 1) -= ux;                                                                                                  \
-    *(pA11 + 1) += *pW;                                                                                                \
-    *(pB2 + 1) -= vx;                                                                                                  \
-    *(pA22 + 1) += *pW;
-
-#define UPDATE_VERT_CUR                                                                                                \
-    *pB1 += uy;                                                                                                        \
-    *pA11 += *pW;                                                                                                      \
-    *pB2 += vy;                                                                                                        \
-    *pA22 += *pW;
-
-#define UPDATE_VERT_NEXT(pB1_next, pA11_next, pB2_next, pA22_next)                                                     \
-    *pB1_next -= uy;                                                                                                   \
-    *pA11_next += *pW;                                                                                                 \
-    *pB2_next -= vy;                                                                                                   \
-    *pA22_next += *pW;
+    const float epsilon_squared = var->epsilon * var->epsilon;
+    const float alpha2 = var->alpha / 2;
+    float *pWeight;
+    float *pA_u, *pA_u_next;
+    float *pA_v, *pA_v_next;
+    float *pB_u, *pB_u_next;
+    float *pB_v, *pB_v_next;
+    const float *cW_u, *cW_u_next, *cW_u_next_row;
+    const float *cW_v, *cW_v_next, *cW_v_next_row;
+    const float *pW_u, *pW_u_next;
+    const float *pW_v, *pW_v_next;
+    float ux, uy, vx, vy;
+    int len;
+    bool touches_right_border = true;
 
     for (int i = start_i; i < end_i; i++)
     {
-        pW = weights.ptr<float>(i);
-        pB1 = b1.ptr<float>(i);
-        pB2 = b2.ptr<float>(i);
-        pA11 = A11.ptr<float>(i);
-        pA22 = A22.ptr<float>(i);
-
-        cW_u = curW_u.ptr<float>(i);
-        cW_v = curW_v.ptr<float>(i);
-        pW_u = W_u.ptr<float>(i);
-        pW_v = W_v.ptr<float>(i);
-        if (i == W_u.rows - 1)
+        if (red_pass)
         {
-            // only horizontal gradients:
-            for (int j = 0; j < W_u.cols - 1; j++)
-            {
-                PROC_HORIZ(cW_u, cW_v, pW_u, pW_v);
-                UPDATE_HORIZ_CUR;
-                UPDATE_HORIZ_NEXT;
-                INC_CUR;
-            }
-        }
-        else
-        {
-            cW_u_next = curW_u.ptr<float>(i + 1);
-            cW_v_next = curW_v.ptr<float>(i + 1);
-            pW_u_next = W_u.ptr<float>(i + 1);
-            pW_v_next = W_v.ptr<float>(i + 1);
-            pB1_next = b1.ptr<float>(i + 1);
-            pB2_next = b2.ptr<float>(i + 1);
-            pA11_next = A11.ptr<float>(i + 1);
-            pA22_next = A22.ptr<float>(i + 1);
+            pWeight = var->weights.red.ptr<float>(i + 1) + 1;
+            pA_u = var->A11.red.ptr<float>(i + 1) + 1;
+            pB_u = var->b1.red.ptr<float>(i + 1) + 1;
+            cW_u = curW_u->red.ptr<float>(i + 1) + 1;
+            pW_u = W_u->red.ptr<float>(i + 1) + 1;
+            pA_v = var->A22.red.ptr<float>(i + 1) + 1;
+            pB_v = var->b2.red.ptr<float>(i + 1) + 1;
+            cW_v = curW_v->red.ptr<float>(i + 1) + 1;
+            pW_v = W_v->red.ptr<float>(i + 1) + 1;
 
-            if (i == start_i && i > 0)
+            cW_u_next_row = curW_u->black.ptr<float>(i + 2) + 1;
+            cW_v_next_row = curW_v->black.ptr<float>(i + 2) + 1;
+
+            if (i % 2 == 0)
             {
-                // also apply operations from the previous row:
-                const float *cW_u_prev = curW_u.ptr<float>(i - 1);
-                const float *cW_v_prev = curW_v.ptr<float>(i - 1);
-                const float *pW_u_prev = W_u.ptr<float>(i - 1);
-                const float *pW_v_prev = W_v.ptr<float>(i - 1);
-                for (int j = 0; j < W_u.cols - 1; j++)
-                {
-                    PROC_ALL(cW_u_prev, cW_v_prev, pW_u_prev, pW_v_prev, cW_u, cW_v, pW_u, pW_v);
-                    UPDATE_VERT_NEXT(pB1, pA11, pB2, pA22);
-                    PROC_ALL(cW_u, cW_v, pW_u, pW_v, cW_u_next, cW_v_next, pW_u_next, pW_v_next);
-                    UPDATE_HORIZ_CUR;
-                    UPDATE_HORIZ_NEXT;
-                    UPDATE_VERT_CUR;
-                    UPDATE_VERT_NEXT(pB1_next, pA11_next, pB2_next, pA22_next);
-                    INC_CUR;
-                    INC_NEXT;
-                    cW_u_prev++;
-                    cW_v_prev++;
-                    pW_u_prev++;
-                    pW_v_prev++;
-                }
-                PROC_VERT(cW_u_prev, cW_v_prev, pW_u_prev, pW_v_prev, cW_u, cW_v, pW_u, pW_v);
-                UPDATE_VERT_NEXT(pB1, pA11, pB2, pA22);
-                PROC_VERT(cW_u, cW_v, pW_u, pW_v, cW_u_next, cW_v_next, pW_u_next, pW_v_next);
-                UPDATE_VERT_CUR;
-                UPDATE_VERT_NEXT(pB1_next, pA11_next, pB2_next, pA22_next);
-            }
-            else if (i == end_i - 1)
-            {
-                // do not update the next row (it's in other processor):
-                for (int j = 0; j < W_u.cols - 1; j++)
-                {
-                    PROC_ALL(cW_u, cW_v, pW_u, pW_v, cW_u_next, cW_v_next, pW_u_next, pW_v_next);
-                    UPDATE_HORIZ_CUR;
-                    UPDATE_HORIZ_NEXT;
-                    UPDATE_VERT_CUR;
-                    INC_CUR;
-                    INC_NEXT;
-                }
-                PROC_VERT(cW_u, cW_v, pW_u, pW_v, cW_u_next, cW_v_next, pW_u_next, pW_v_next);
-                UPDATE_VERT_CUR;
+                pA_u_next = var->A11.black.ptr<float>(i + 1) + 1;
+                pB_u_next = var->b1.black.ptr<float>(i + 1) + 1;
+                cW_u_next = curW_u->black.ptr<float>(i + 1) + 1;
+                pW_u_next = W_u->black.ptr<float>(i + 1) + 1;
+                pA_v_next = var->A22.black.ptr<float>(i + 1) + 1;
+                pB_v_next = var->b2.black.ptr<float>(i + 1) + 1;
+                cW_v_next = curW_v->black.ptr<float>(i + 1) + 1;
+                pW_v_next = W_v->black.ptr<float>(i + 1) + 1;
+                len = var->A11.red_even_len;
+                if (var->A11.red_even_len > var->A11.red_odd_len)
+                    touches_right_border = true;
+                else
+                    touches_right_border = false;
             }
             else
             {
-                for (int j = 0; j < W_u.cols - 1; j++)
-                {
-                    PROC_ALL(cW_u, cW_v, pW_u, pW_v, cW_u_next, cW_v_next, pW_u_next, pW_v_next);
-                    UPDATE_HORIZ_CUR;
-                    UPDATE_HORIZ_NEXT;
-                    UPDATE_VERT_CUR;
-                    UPDATE_VERT_NEXT(pB1_next, pA11_next, pB2_next, pA22_next);
-                    INC_CUR;
-                    INC_NEXT;
-                }
-                PROC_VERT(cW_u, cW_v, pW_u, pW_v, cW_u_next, cW_v_next, pW_u_next, pW_v_next);
-                UPDATE_VERT_CUR;
-                UPDATE_VERT_NEXT(pB1_next, pA11_next, pB2_next, pA22_next);
+                pA_u_next = var->A11.black.ptr<float>(i + 1) + 2;
+                pB_u_next = var->b1.black.ptr<float>(i + 1) + 2;
+                cW_u_next = curW_u->black.ptr<float>(i + 1) + 2;
+                pW_u_next = W_u->black.ptr<float>(i + 1) + 2;
+                pA_v_next = var->A22.black.ptr<float>(i + 1) + 2;
+                pB_v_next = var->b2.black.ptr<float>(i + 1) + 2;
+                cW_v_next = curW_v->black.ptr<float>(i + 1) + 2;
+                pW_v_next = W_v->black.ptr<float>(i + 1) + 2;
+                len = var->A11.red_odd_len;
+                if (var->A11.red_even_len > var->A11.red_odd_len)
+                    touches_right_border = false;
+                else
+                    touches_right_border = true;
             }
         }
+        else
+        {
+            pWeight = var->weights.black.ptr<float>(i + 1) + 1;
+            pA_u = var->A11.black.ptr<float>(i + 1) + 1;
+            pB_u = var->b1.black.ptr<float>(i + 1) + 1;
+            cW_u = curW_u->black.ptr<float>(i + 1) + 1;
+            pW_u = W_u->black.ptr<float>(i + 1) + 1;
+            pA_v = var->A22.black.ptr<float>(i + 1) + 1;
+            pB_v = var->b2.black.ptr<float>(i + 1) + 1;
+            cW_v = curW_v->black.ptr<float>(i + 1) + 1;
+            pW_v = W_v->black.ptr<float>(i + 1) + 1;
+
+            cW_u_next_row = curW_u->red.ptr<float>(i + 2) + 1;
+            cW_v_next_row = curW_v->red.ptr<float>(i + 2) + 1;
+
+            if (i % 2 == 0)
+            {
+                pA_u_next = var->A11.red.ptr<float>(i + 1) + 2;
+                pB_u_next = var->b1.red.ptr<float>(i + 1) + 2;
+                cW_u_next = curW_u->red.ptr<float>(i + 1) + 2;
+                pW_u_next = W_u->red.ptr<float>(i + 1) + 2;
+                pA_v_next = var->A22.red.ptr<float>(i + 1) + 2;
+                pB_v_next = var->b2.red.ptr<float>(i + 1) + 2;
+                cW_v_next = curW_v->red.ptr<float>(i + 1) + 2;
+                pW_v_next = W_v->red.ptr<float>(i + 1) + 2;
+                len = var->A11.black_even_len;
+                if (var->A11.black_even_len < var->A11.black_odd_len)
+                    touches_right_border = false;
+                else
+                    touches_right_border = true;
+            }
+            else
+            {
+                pA_u_next = var->A11.red.ptr<float>(i + 1) + 1;
+                pB_u_next = var->b1.red.ptr<float>(i + 1) + 1;
+                cW_u_next = curW_u->red.ptr<float>(i + 1) + 1;
+                pW_u_next = W_u->red.ptr<float>(i + 1) + 1;
+                pA_v_next = var->A22.red.ptr<float>(i + 1) + 1;
+                pB_v_next = var->b2.red.ptr<float>(i + 1) + 1;
+                cW_v_next = curW_v->red.ptr<float>(i + 1) + 1;
+                pW_v_next = W_v->red.ptr<float>(i + 1) + 1;
+                len = var->A11.black_odd_len;
+                if (var->A11.black_even_len < var->A11.black_odd_len)
+                    touches_right_border = true;
+                else
+                    touches_right_border = false;
+            }
+        }
+
+#define COMPUTE                                                                                                        \
+    /*gradients for the flow on the current fixed-point iteration:*/                                                   \
+    ux = cW_u_next[j] - cW_u[j];                                                                                       \
+    vx = cW_v_next[j] - cW_v[j];                                                                                       \
+    uy = cW_u_next_row[j] - cW_u[j];                                                                                   \
+    vy = cW_v_next_row[j] - cW_v[j];                                                                                   \
+    /* weight of the smoothness term in the current fixed-point iteration:*/                                           \
+    pWeight[j] = alpha2 / sqrt(ux * ux + vx * vx + uy * uy + vy * vy + epsilon_squared);                               \
+    /* gradients for initial raw flow multiplied by weight:*/                                                          \
+    ux = pWeight[j] * (pW_u_next[j] - pW_u[j]);                                                                        \
+    vx = pWeight[j] * (pW_v_next[j] - pW_v[j]);
+
+#define UPDATE_HOR                                                                                                     \
+    pB_u[j] += ux;                                                                                                     \
+    pA_u[j] += pWeight[j];                                                                                             \
+    pB_v[j] += vx;                                                                                                     \
+    pA_v[j] += pWeight[j];                                                                                             \
+    pB_u_next[j] -= ux;                                                                                                \
+    pA_u_next[j] += pWeight[j];                                                                                        \
+    pB_v_next[j] -= vx;                                                                                                \
+    pA_v_next[j] += pWeight[j];
+
+        int j = 0;
+#ifdef CV_SIMD128
+        v_float32x4 alpha2_vec = v_setall_f32(alpha2);
+        v_float32x4 eps_vec = v_setall_f32(epsilon_squared);
+        v_float32x4 cW_u_vec, cW_v_vec;
+        v_float32x4 pWeight_vec, ux_vec, vx_vec, uy_vec, vy_vec;
+
+        for (; j < len - 4; j += 4)
+        {
+            cW_u_vec = v_load(cW_u + j);
+            cW_v_vec = v_load(cW_v + j);
+
+            ux_vec = v_load(cW_u_next + j) - cW_u_vec;
+            vx_vec = v_load(cW_v_next + j) - cW_v_vec;
+            uy_vec = v_load(cW_u_next_row + j) - cW_u_vec;
+            vy_vec = v_load(cW_v_next_row + j) - cW_v_vec;
+            pWeight_vec =
+              alpha2_vec / v_sqrt(ux_vec * ux_vec + vx_vec * vx_vec + uy_vec * uy_vec + vy_vec * vy_vec + eps_vec);
+            v_store(pWeight + j, pWeight_vec);
+
+            ux_vec = pWeight_vec * (v_load(pW_u_next + j) - v_load(pW_u + j));
+            vx_vec = pWeight_vec * (v_load(pW_v_next + j) - v_load(pW_v + j));
+
+            v_store(pA_u + j, v_load(pA_u + j) + pWeight_vec);
+            v_store(pA_v + j, v_load(pA_v + j) + pWeight_vec);
+            v_store(pB_u + j, v_load(pB_u + j) + ux_vec);
+            v_store(pB_v + j, v_load(pB_v + j) + vx_vec);
+
+            v_store(pA_u_next + j, v_load(pA_u_next + j) + pWeight_vec);
+            v_store(pA_v_next + j, v_load(pA_v_next + j) + pWeight_vec);
+            v_store(pB_u_next + j, v_load(pB_u_next + j) - ux_vec);
+            v_store(pB_v_next + j, v_load(pB_v_next + j) - vx_vec);
+        }
+#endif
+        for (; j < len - 1; j++)
+        {
+            COMPUTE;
+            UPDATE_HOR;
+        }
+        if (touches_right_border)
+        {
+            COMPUTE;
+        }
+        else
+        {
+            COMPUTE;
+            UPDATE_HOR;
+        }
     }
-#undef PROC_ALL
-#undef PROC_VERT
-#undef PROC_HORIZ
-#undef INC_CUR
-#undef INC_NEXT
-#undef UPDATE_HORIZ_CUR
-#undef UPDATE_HORIZ_NEXT
-#undef UPDATE_VERT_CUR
-#undef UPDATE_VERT_NEXT
 }
 
-VariationalRefinementImpl::ComputeTerms_ParBody::ComputeTerms_ParBody(VariationalRefinementImpl &_var, int _nstripes,
-                                                                      int _h, Mat &_W_u, Mat &_W_v, Mat &_dW_u,
-                                                                      Mat &_dW_v, Mat &_tempW_u, Mat &_tempW_v)
-    : var(&_var), nstripes(_nstripes), h(_h), W_u(&_W_u), W_v(&_W_v), dW_u(&_dW_u), dW_v(&_dW_v), tempW_u(&_tempW_u),
-      tempW_v(&_tempW_v)
+VariationalRefinementImpl::ComputeSmoothnessTermVertPass_ParBody::ComputeSmoothnessTermVertPass_ParBody(
+    VariationalRefinementImpl &_var, int _nstripes, int _h, RedBlackBuffer &_W_u, RedBlackBuffer &_W_v, bool _red_pass)
+    : var(&_var), nstripes(_nstripes), h(_h-1), W_u(&_W_u), W_v(&_W_v),
+    red_pass(_red_pass)
 {
     stripe_sz = (int)ceil(h / (double)nstripes);
 }
 
-void VariationalRefinementImpl::ComputeTerms_ParBody::operator()(const Range &range) const
+void VariationalRefinementImpl::ComputeSmoothnessTermVertPass_ParBody::operator()(const Range &range) const
 {
-    int start = min(range.start * stripe_sz, h);
-    int end = min(range.end * stripe_sz, h);
-    var->computeDataTerm(*dW_u, *dW_v, start, end);
-    var->computeSmoothnessTerm(*W_u, *W_v, *tempW_u, *tempW_v, start, end);
+    int start_i = min(range.start * stripe_sz, h);
+    int end_i = min(range.end * stripe_sz, h);
+
+    const float epsilon_squared = var->epsilon * var->epsilon;
+    const float alpha2 = var->alpha / 2;
+    float *pWeight;
+    float *pA_u, *pA_u_next_row;
+    float *pA_v, *pA_v_next_row;
+    float *pB_u, *pB_u_next_row;
+    float *pB_v, *pB_v_next_row;
+    const float *pW_u, *pW_u_next_row;
+    const float *pW_v, *pW_v_next_row;
+    float vy, uy;
+    int len;
+
+    for (int i = start_i; i < end_i; i++)
+    {
+        if (red_pass)
+        {
+            pWeight = var->weights.red.ptr<float>(i + 1) + 1;
+            pA_u = var->A11.red.ptr<float>(i + 1) + 1;
+            pB_u = var->b1.red.ptr<float>(i + 1) + 1;
+            pW_u = W_u->red.ptr<float>(i + 1) + 1;
+            pA_v = var->A22.red.ptr<float>(i + 1) + 1;
+            pB_v = var->b2.red.ptr<float>(i + 1) + 1;
+            pW_v = W_v->red.ptr<float>(i + 1) + 1;
+
+            pA_u_next_row = var->A11.black.ptr<float>(i + 2) + 1;
+            pB_u_next_row = var->b1.black.ptr<float>(i + 2) + 1;
+            pW_u_next_row = W_u->black.ptr<float>(i + 2) + 1;
+            pA_v_next_row = var->A22.black.ptr<float>(i + 2) + 1;
+            pB_v_next_row = var->b2.black.ptr<float>(i + 2) + 1;
+            pW_v_next_row = W_v->black.ptr<float>(i + 2) + 1;
+
+            if (i % 2 == 0)
+                len = var->A11.red_even_len;
+            else
+                len = var->A11.red_odd_len;
+        }
+        else
+        {
+            pWeight = var->weights.black.ptr<float>(i + 1) + 1;
+            pA_u = var->A11.black.ptr<float>(i + 1) + 1;
+            pB_u = var->b1.black.ptr<float>(i + 1) + 1;
+            pW_u = W_u->black.ptr<float>(i + 1) + 1;
+            pA_v = var->A22.black.ptr<float>(i + 1) + 1;
+            pB_v = var->b2.black.ptr<float>(i + 1) + 1;
+            pW_v = W_v->black.ptr<float>(i + 1) + 1;
+
+            pA_u_next_row = var->A11.red.ptr<float>(i + 2) + 1;
+            pB_u_next_row = var->b1.red.ptr<float>(i + 2) + 1;
+            pW_u_next_row = W_u->red.ptr<float>(i + 2) + 1;
+            pA_v_next_row = var->A22.red.ptr<float>(i + 2) + 1;
+            pB_v_next_row = var->b2.red.ptr<float>(i + 2) + 1;
+            pW_v_next_row = W_v->red.ptr<float>(i + 2) + 1;
+
+            if (i % 2 == 0)
+                len = var->A11.black_even_len;
+            else
+                len = var->A11.black_odd_len;
+        }
+        int j = 0;
+#ifdef CV_SIMD128
+        v_float32x4 pWeight_vec, uy_vec, vy_vec;
+        for (; j < len - 3; j += 4)
+        {
+            pWeight_vec = v_load(pWeight + j);
+            uy_vec = pWeight_vec * (v_load(pW_u_next_row + j) - v_load(pW_u + j));
+            vy_vec = pWeight_vec * (v_load(pW_v_next_row + j) - v_load(pW_v + j));
+
+            v_store(pA_u + j, v_load(pA_u + j) + pWeight_vec);
+            v_store(pA_v + j, v_load(pA_v + j) + pWeight_vec);
+            v_store(pB_u + j, v_load(pB_u + j) + uy_vec);
+            v_store(pB_v + j, v_load(pB_v + j) + vy_vec);
+
+            v_store(pA_u_next_row + j, v_load(pA_u_next_row + j) + pWeight_vec);
+            v_store(pA_v_next_row + j, v_load(pA_v_next_row + j) + pWeight_vec);
+            v_store(pB_u_next_row + j, v_load(pB_u_next_row + j) - uy_vec);
+            v_store(pB_v_next_row + j, v_load(pB_v_next_row + j) - vy_vec);
+        }
+#endif
+        for (; j < len; j++)
+        {
+            uy = pWeight[j] * (pW_u_next_row[j] - pW_u[j]);
+            vy = pWeight[j] * (pW_v_next_row[j] - pW_v[j]);
+            pB_u[j] += uy;
+            pA_u[j] += pWeight[j];
+            pB_v[j] += vy;
+            pA_v[j] += pWeight[j];
+            pB_u_next_row[j] -= uy;
+            pA_u_next_row[j] += pWeight[j];
+            pB_v_next_row[j] -= vy;
+            pA_v_next_row[j] += pWeight[j];
+        }
+    }
 }
 
-VariationalRefinementImpl::RedBlackSOR_ParBody::RedBlackSOR_ParBody(VariationalRefinementImpl &_var, bool is_red_pass,
-                                                                    int _chunk_sz, int _nstripes, int _h, Mat &_dW_u,
-                                                                    Mat &_dW_v)
-    : var(&_var), nstripes(_nstripes), h(_h), chunk_sz(_chunk_sz), is_red(is_red_pass), dW_u(&_dW_u), dW_v(&_dW_v)
+VariationalRefinementImpl::RedBlackSOR_ParBody::RedBlackSOR_ParBody(VariationalRefinementImpl &_var, int _nstripes,
+                                                                    int _h, RedBlackBuffer &_dW_u,
+                                                                    RedBlackBuffer &_dW_v, bool _red_pass)
+    : var(&_var), nstripes(_nstripes), h(_h), dW_u(&_dW_u), dW_v(&_dW_v), red_pass(_red_pass)
 {
     stripe_sz = (int)ceil(h / (double)nstripes);
 }
-
-#define UPDATE_UV                                                                                                      \
-    *pdu += omega * ((sigmaU + *pb1 - *pdv * *pa12) / *pa11 - *pdu);                                                   \
-    *pdv += omega * ((sigmaV + *pb2 - *pdu * *pa12) / *pa22 - *pdv);                                                   \
-    pa11++;                                                                                                            \
-    pa12++;                                                                                                            \
-    pa22++;                                                                                                            \
-    pb1++;                                                                                                             \
-    pb2++;                                                                                                             \
-    pdu++;                                                                                                             \
-    pdv++;                                                                                                             \
-    pW++;
-
-inline void processChunkLT(float *pa11, float *pa12, float *pa22, float *pb1, float *pb2, float *pW, float *pdu,
-                           float *pdv, float omega, int s, int chunk_sz)
-{
-    float sigmaU, sigmaV;
-    sigmaU = *pW * *(pdu + 1) + *pW * *(pdu + s);
-    sigmaV = *pW * *(pdv + 1) + *pW * *(pdv + s);
-    UPDATE_UV;
-    for (int i = 1; i < chunk_sz; i++)
-    {
-        sigmaU = *(pW - 1) * *(pdu - 1) + *pW * *(pdu + 1) + *pW * *(pdu + s);
-        sigmaV = *(pW - 1) * *(pdv - 1) + *pW * *(pdv + 1) + *pW * *(pdv + s);
-        UPDATE_UV;
-    }
-}
-
-inline void processChunkMT(float *pa11, float *pa12, float *pa22, float *pb1, float *pb2, float *pW, float *pdu,
-                           float *pdv, float omega, int s, int chunk_sz)
-{
-    float sigmaU, sigmaV;
-    for (int i = 0; i < chunk_sz; i++)
-    {
-        sigmaU = *(pW - 1) * *(pdu - 1) + *pW * *(pdu + 1) + *pW * *(pdu + s);
-        sigmaV = *(pW - 1) * *(pdv - 1) + *pW * *(pdv + 1) + *pW * *(pdv + s);
-        UPDATE_UV;
-    }
-}
-
-inline void processChunkRT(float *pa11, float *pa12, float *pa22, float *pb1, float *pb2, float *pW, float *pdu,
-                           float *pdv, float omega, int s, int chunk_sz)
-{
-    float sigmaU, sigmaV;
-    for (int i = 0; i < chunk_sz - 1; i++)
-    {
-        sigmaU = *(pW - 1) * *(pdu - 1) + *pW * *(pdu + 1) + *pW * *(pdu + s);
-        sigmaV = *(pW - 1) * *(pdv - 1) + *pW * *(pdv + 1) + *pW * *(pdv + s);
-        UPDATE_UV;
-    }
-    sigmaU = *(pW - 1) * *(pdu - 1) + *pW * *(pdu + s);
-    sigmaV = *(pW - 1) * *(pdv - 1) + *pW * *(pdv + s);
-    UPDATE_UV;
-}
-
-inline void processChunkLM(float *pa11, float *pa12, float *pa22, float *pb1, float *pb2, float *pW, float *pdu,
-                           float *pdv, float omega, int s, int chunk_sz)
-{
-    float sigmaU, sigmaV;
-    sigmaU = *pW * *(pdu + 1) + *(pW - s) * *(pdu - s) + *pW * *(pdu + s);
-    sigmaV = *pW * *(pdv + 1) + *(pW - s) * *(pdv - s) + *pW * *(pdv + s);
-    UPDATE_UV;
-    for (int i = 1; i < chunk_sz; i++)
-    {
-        sigmaU = *(pW - 1) * *(pdu - 1) + *pW * *(pdu + 1) + *(pW - s) * *(pdu - s) + *pW * *(pdu + s);
-        sigmaV = *(pW - 1) * *(pdv - 1) + *pW * *(pdv + 1) + *(pW - s) * *(pdv - s) + *pW * *(pdv + s);
-        UPDATE_UV;
-    }
-}
-
-inline void processChunkMM(float *pa11, float *pa12, float *pa22, float *pb1, float *pb2, float *pW, float *pdu,
-                           float *pdv, float omega, int s, int chunk_sz)
-{
-    float sigmaU, sigmaV;
-    for (int i = 0; i < chunk_sz; i++)
-    {
-        sigmaU = *(pW - 1) * *(pdu - 1) + *pW * *(pdu + 1) + *(pW - s) * *(pdu - s) + *pW * *(pdu + s);
-        sigmaV = *(pW - 1) * *(pdv - 1) + *pW * *(pdv + 1) + *(pW - s) * *(pdv - s) + *pW * *(pdv + s);
-        UPDATE_UV;
-    }
-}
-
-inline void processChunkRM(float *pa11, float *pa12, float *pa22, float *pb1, float *pb2, float *pW, float *pdu,
-                           float *pdv, float omega, int s, int chunk_sz)
-{
-    float sigmaU, sigmaV;
-    for (int i = 0; i < chunk_sz - 1; i++)
-    {
-        sigmaU = *(pW - 1) * *(pdu - 1) + *pW * *(pdu + 1) + *(pW - s) * *(pdu - s) + *pW * *(pdu + s);
-        sigmaV = *(pW - 1) * *(pdv - 1) + *pW * *(pdv + 1) + *(pW - s) * *(pdv - s) + *pW * *(pdv + s);
-        UPDATE_UV;
-    }
-    sigmaU = *(pW - 1) * *(pdu - 1) + *(pW - s) * *(pdu - s) + *pW * *(pdu + s);
-    sigmaV = *(pW - 1) * *(pdv - 1) + *(pW - s) * *(pdv - s) + *pW * *(pdv + s);
-    UPDATE_UV;
-}
-
-inline void processChunkLB(float *pa11, float *pa12, float *pa22, float *pb1, float *pb2, float *pW, float *pdu,
-                           float *pdv, float omega, int s, int chunk_sz)
-{
-    float sigmaU, sigmaV;
-    sigmaU = *pW * *(pdu + 1) + *(pW - s) * *(pdu - s);
-    sigmaV = *pW * *(pdv + 1) + *(pW - s) * *(pdv - s);
-    UPDATE_UV;
-    for (int i = 1; i < chunk_sz; i++)
-    {
-        sigmaU = *(pW - 1) * *(pdu - 1) + *pW * *(pdu + 1) + *(pW - s) * *(pdu - s);
-        sigmaV = *(pW - 1) * *(pdv - 1) + *pW * *(pdv + 1) + *(pW - s) * *(pdv - s);
-        UPDATE_UV;
-    }
-}
-
-inline void processChunkMB(float *pa11, float *pa12, float *pa22, float *pb1, float *pb2, float *pW, float *pdu,
-                           float *pdv, float omega, int s, int chunk_sz)
-{
-    float sigmaU, sigmaV;
-    for (int i = 0; i < chunk_sz; i++)
-    {
-        sigmaU = *(pW - 1) * *(pdu - 1) + *pW * *(pdu + 1) + *(pW - s) * *(pdu - s);
-        sigmaV = *(pW - 1) * *(pdv - 1) + *pW * *(pdv + 1) + *(pW - s) * *(pdv - s);
-        UPDATE_UV;
-    }
-}
-
-inline void processChunkRB(float *pa11, float *pa12, float *pa22, float *pb1, float *pb2, float *pW, float *pdu,
-                           float *pdv, float omega, int s, int chunk_sz)
-{
-    float sigmaU, sigmaV;
-    for (int i = 0; i < chunk_sz - 1; i++)
-    {
-        sigmaU = *(pW - 1) * *(pdu - 1) + *pW * *(pdu + 1) + *(pW - s) * *(pdu - s);
-        sigmaV = *(pW - 1) * *(pdv - 1) + *pW * *(pdv + 1) + *(pW - s) * *(pdv - s);
-        UPDATE_UV;
-    }
-    sigmaU = *(pW - 1) * *(pdu - 1) + *(pW - s) * *(pdu - s);
-    sigmaV = *(pW - 1) * *(pdv - 1) + *(pW - s) * *(pdv - s);
-    UPDATE_UV;
-}
-
-#undef UPDATE_UV
 
 void VariationalRefinementImpl::RedBlackSOR_ParBody::operator()(const Range &range) const
 {
-    CV_Assert(dW_u->cols > chunk_sz);
     int start = min(range.start * stripe_sz, h);
     int end = min(range.end * stripe_sz, h);
 
-    float *pa11, *pa12, *pa22, *pb1, *pb2, *pW;
-    float *pdu, *pdv;
+    float *pa11, *pa12, *pa22, *pb1, *pb2, *pW, *pdu, *pdv;
+    float *pW_next, *pdu_next, *pdv_next;
+    float *pW_prev_row, *pdu_prev_row, *pdv_prev_row;
+    float *pdu_next_row, *pdv_next_row;
 
-    int cols = dW_u->cols;
-    int rows = dW_u->rows;
-    int s = dW_u->cols; // step between rows
-
-#define PROC_ROW(lfunc, mfunc, rfunc)                                                                                  \
-    {                                                                                                                  \
-        if (j == 0)                                                                                                    \
-        {                                                                                                              \
-            lfunc(pa11 + j, pa12 + j, pa22 + j, pb1 + j, pb2 + j, pW + j, pdu + j, pdv + j, omega, s, chunk_sz);       \
-            j += 2 * chunk_sz;                                                                                         \
-        }                                                                                                              \
-        for (; j < cols - 2 * chunk_sz; j += 2 * chunk_sz)                                                             \
-            mfunc(pa11 + j, pa12 + j, pa22 + j, pb1 + j, pb2 + j, pW + j, pdu + j, pdv + j, omega, s, chunk_sz);       \
-        if (j + chunk_sz >= cols)                                                                                      \
-            rfunc(pa11 + j, pa12 + j, pa22 + j, pb1 + j, pb2 + j, pW + j, pdu + j, pdv + j, omega, s, cols - j);       \
-        else                                                                                                           \
-            mfunc(pa11 + j, pa12 + j, pa22 + j, pb1 + j, pb2 + j, pW + j, pdu + j, pdv + j, omega, s, chunk_sz);       \
-    }
-
+    float sigmaU, sigmaV;
     float omega = var->omega;
-    int j;
+    int j,len;
     for (int i = start; i < end; i++)
     {
-        pa11 = var->A11.ptr<float>(i);
-        pa12 = var->A12.ptr<float>(i);
-        pa22 = var->A22.ptr<float>(i);
-        pb1 = var->b1.ptr<float>(i);
-        pb2 = var->b2.ptr<float>(i);
-        pW = var->weights.ptr<float>(i);
-        pdu = dW_u->ptr<float>(i);
-        pdv = dW_v->ptr<float>(i);
+        if (red_pass)
+        {
+            pW = var->weights.red.ptr<float>(i + 1) + 1;
+            pa11 = var->A11.red.ptr<float>(i + 1) + 1;
+            pa12 = var->A12.red.ptr<float>(i + 1) + 1;
+            pa22 = var->A22.red.ptr<float>(i + 1) + 1;
+            pb1 = var->b1.red.ptr<float>(i + 1) + 1;
+            pb2 = var->b2.red.ptr<float>(i + 1) + 1;
+            pdu = dW_u->red.ptr<float>(i + 1) + 1;
+            pdv = dW_v->red.ptr<float>(i + 1) + 1;
 
-        if (is_red)
-            j = (i % 2) * chunk_sz;
-        else
-            j = ((i + 1) % 2) * chunk_sz;
+            pdu_next_row = dW_u->black.ptr<float>(i + 2) + 1;
+            pdv_next_row = dW_v->black.ptr<float>(i + 2) + 1;
 
-        if (i == 0)
-            PROC_ROW(processChunkLT, processChunkMT, processChunkRT)
-        else if (i == rows - 1)
-            PROC_ROW(processChunkLB, processChunkMB, processChunkRB)
+            pW_prev_row = var->weights.black.ptr<float>(i) + 1;
+            pdu_prev_row = dW_u->black.ptr<float>(i) + 1;
+            pdv_prev_row = dW_v->black.ptr<float>(i) + 1;
+
+            if (i % 2 == 0)
+            {
+                pW_next = var->weights.black.ptr<float>(i + 1) + 1;
+                pdu_next = dW_u->black.ptr<float>(i + 1) + 1;
+                pdv_next = dW_v->black.ptr<float>(i + 1) + 1;
+                len = var->A11.red_even_len;
+            }
+            else
+            {
+                pW_next = var->weights.black.ptr<float>(i + 1) + 2;
+                pdu_next = dW_u->black.ptr<float>(i + 1) + 2;
+                pdv_next = dW_v->black.ptr<float>(i + 1) + 2;
+                len = var->A11.red_odd_len;
+            }
+        }
         else
-            PROC_ROW(processChunkLM, processChunkMM, processChunkRM)
+        {
+            pW = var->weights.black.ptr<float>(i + 1) + 1;
+            pa11 = var->A11.black.ptr<float>(i + 1) + 1;
+            pa12 = var->A12.black.ptr<float>(i + 1) + 1;
+            pa22 = var->A22.black.ptr<float>(i + 1) + 1;
+            pb1 = var->b1.black.ptr<float>(i + 1) + 1;
+            pb2 = var->b2.black.ptr<float>(i + 1) + 1;
+            pdu = dW_u->black.ptr<float>(i + 1) + 1;
+            pdv = dW_v->black.ptr<float>(i + 1) + 1;
+
+            pdu_next_row = dW_u->red.ptr<float>(i + 2) + 1;
+            pdv_next_row = dW_v->red.ptr<float>(i + 2) + 1;
+
+            pW_prev_row = var->weights.red.ptr<float>(i) + 1;
+            pdu_prev_row = dW_u->red.ptr<float>(i) + 1;
+            pdv_prev_row = dW_v->red.ptr<float>(i) + 1;
+
+            if (i % 2 == 0)
+            {
+                pW_next = var->weights.red.ptr<float>(i + 1) + 2;
+                pdu_next = dW_u->red.ptr<float>(i + 1) + 2;
+                pdv_next = dW_v->red.ptr<float>(i + 1) + 2;
+                len = var->A11.black_even_len;
+            }
+            else
+            {
+                pW_next = var->weights.red.ptr<float>(i + 1) + 1;
+                pdu_next = dW_u->red.ptr<float>(i + 1) + 1;
+                pdv_next = dW_v->red.ptr<float>(i + 1) + 1;
+                len = var->A11.black_odd_len;
+            }
+        }
+        j = 0;
+#ifdef CV_SIMD128
+        v_float32x4 pW_prev_vec = v_setall_f32(pW_next[-1]);
+        v_float32x4 pdu_prev_vec = v_setall_f32(pdu_next[-1]);
+        v_float32x4 pdv_prev_vec = v_setall_f32(pdv_next[-1]);
+        v_float32x4 omega_vec = v_setall_f32(omega);
+        v_float32x4 pW_vec, pW_next_vec, pW_prev_row_vec;
+        v_float32x4 pdu_next_vec, pdu_prev_row_vec, pdu_next_row_vec;
+        v_float32x4 pdv_next_vec, pdv_prev_row_vec, pdv_next_row_vec;
+        v_float32x4 pW_shifted_vec, pdu_shifted_vec, pdv_shifted_vec;
+        v_float32x4 pa12_vec, sigmaU_vec, sigmaV_vec, pdu_vec, pdv_vec;
+        for (; j < len - 3; j += 4)
+        {
+            pW_vec = v_load(pW + j);
+            pW_next_vec = v_load(pW_next + j);
+            pW_prev_row_vec = v_load(pW_prev_row + j);
+            pdu_next_vec = v_load(pdu_next + j);
+            pdu_prev_row_vec = v_load(pdu_prev_row + j);
+            pdu_next_row_vec = v_load(pdu_next_row + j);
+            pdv_next_vec = v_load(pdv_next + j);
+            pdv_prev_row_vec = v_load(pdv_prev_row + j);
+            pdv_next_row_vec = v_load(pdv_next_row + j);
+            pa12_vec = v_load(pa12 + j);
+            pW_shifted_vec = v_reinterpret_as_f32(
+              v_extract<3, v_int32x4>(v_reinterpret_as_s32(pW_prev_vec), v_reinterpret_as_s32(pW_next_vec)));
+            pdu_shifted_vec = v_reinterpret_as_f32(
+              v_extract<3, v_int32x4>(v_reinterpret_as_s32(pdu_prev_vec), v_reinterpret_as_s32(pdu_next_vec)));
+            pdv_shifted_vec = v_reinterpret_as_f32(
+              v_extract<3, v_int32x4>(v_reinterpret_as_s32(pdv_prev_vec), v_reinterpret_as_s32(pdv_next_vec)));
+
+            sigmaU_vec = pW_shifted_vec * pdu_shifted_vec + pW_vec * pdu_next_vec + pW_prev_row_vec * pdu_prev_row_vec +
+                         pW_vec * pdu_next_row_vec;
+            sigmaV_vec = pW_shifted_vec * pdv_shifted_vec + pW_vec * pdv_next_vec + pW_prev_row_vec * pdv_prev_row_vec +
+                         pW_vec * pdv_next_row_vec;
+
+            pdu_vec = v_load(pdu + j);
+            pdv_vec = v_load(pdv + j);
+            pdu_vec += omega_vec * ((sigmaU_vec + v_load(pb1 + j) - pdv_vec * pa12_vec) / v_load(pa11 + j) - pdu_vec);
+            pdv_vec += omega_vec * ((sigmaV_vec + v_load(pb2 + j) - pdu_vec * pa12_vec) / v_load(pa22 + j) - pdv_vec);
+            v_store(pdu + j, pdu_vec);
+            v_store(pdv + j, pdv_vec);
+
+            pW_prev_vec = pW_next_vec;
+            pdu_prev_vec = pdu_next_vec;
+            pdv_prev_vec = pdv_next_vec;
+        }
+#endif
+        for (; j < len; j++)
+        {
+            sigmaU = pW_next[j - 1] * pdu_next[j - 1] + pW[j] * pdu_next[j] + pW_prev_row[j] * pdu_prev_row[j] +
+                     pW[j] * pdu_next_row[j];
+            sigmaV = pW_next[j - 1] * pdv_next[j - 1] + pW[j] * pdv_next[j] + pW_prev_row[j] * pdv_prev_row[j] +
+                     pW[j] * pdv_next_row[j];
+            pdu[j] += omega * ((sigmaU + pb1[j] - pdv[j] * pa12[j]) / pa11[j] - pdu[j]);
+            pdv[j] += omega * ((sigmaV + pb2[j] - pdu[j] * pa12[j]) / pa22[j] - pdv[j]);
+        }
     }
-#undef PROC_ROW
 }
 
 void VariationalRefinementImpl::calc(InputArray I0, InputArray I1, InputOutputArray flow)
@@ -840,11 +1135,10 @@ void VariationalRefinementImpl::calc(InputArray I0, InputArray I1, InputOutputAr
     CV_Assert(!flow.empty() && flow.depth() == CV_32F && flow.channels() == 2);
     CV_Assert(I0.sameSize(flow));
 
-    Mat u, v;
+    Mat uv[2];
     Mat &flowMat = flow.getMatRef();
-    Mat uv[] = {u, v};
     split(flowMat, uv);
-    calcUV(I0, I1, u, v);
+    calcUV(I0, I1, uv[0], uv[1]);
     merge(uv, 2, flowMat);
 }
 void VariationalRefinementImpl::calcUV(InputArray I0, InputArray I1, InputOutputArray flow_u, InputOutputArray flow_v)
@@ -856,6 +1150,8 @@ void VariationalRefinementImpl::calcUV(InputArray I0, InputArray I1, InputOutput
     CV_Assert(!flow_v.empty() && flow_v.depth() == CV_32F && flow_v.channels() == 1);
     CV_Assert(I0.sameSize(flow_u));
     CV_Assert(flow_u.sameSize(flow_v));
+
+    double startTick, time;
 
     Mat I0Mat = I0.getMat();
     Mat I1Mat = I1.getMat();
@@ -873,32 +1169,39 @@ void VariationalRefinementImpl::calcUV(InputArray I0, InputArray I1, InputOutput
     dW_u.black.setTo(0.0f);
     dW_v.red.setTo(0.0f);
     dW_v.black.setTo(0.0f);
-    double  startTick, time;
+    
+
     for (int i = 0; i < fixedPointIterations; i++)
     {
-        startTick = (double)getTickCount();
+        parallel_for_(Range(0, num_stripes), ComputeDataTerm_ParBody(*this, num_stripes, I0Mat.rows, dW_u, dW_v, true));
         parallel_for_(Range(0, num_stripes),
-                      ComputeTerms_ParBody(*this, num_stripes, I0Mat.rows, W_u, W_v, dW_u, dW_v, tempW_u, tempW_v));
-        time = ((double)getTickCount() - startTick) / getTickFrequency();
-        time_terms += time;
+                      ComputeDataTerm_ParBody(*this, num_stripes, I0Mat.rows, dW_u, dW_v, false));
 
-        startTick = (double)getTickCount();
+        parallel_for_(Range(0, num_stripes), ComputeSmoothnessTermHorPass_ParBody(*this, num_stripes, I0Mat.rows, W_u_rb,
+                                                                           W_v_rb, tempW_u, tempW_v, true));
+        parallel_for_(Range(0, num_stripes), ComputeSmoothnessTermHorPass_ParBody(*this, num_stripes, I0Mat.rows, W_u_rb,
+                                                                           W_v_rb, tempW_u, tempW_v, false));
+        parallel_for_(Range(0, num_stripes), ComputeSmoothnessTermVertPass_ParBody(*this, num_stripes, I0Mat.rows, W_u_rb,
+            W_v_rb, true));
+        parallel_for_(Range(0, num_stripes), ComputeSmoothnessTermVertPass_ParBody(*this, num_stripes, I0Mat.rows, W_u_rb,
+            W_v_rb, false));
+
         for (int j = 0; j < sorIterations; j++)
         {
-            // compute all red vertices in parallel:
+            parallel_for_(Range(0, num_stripes), RedBlackSOR_ParBody(*this, num_stripes, I0Mat.rows, dW_u, dW_v, true));
             parallel_for_(Range(0, num_stripes),
-                          RedBlackSOR_ParBody(*this, true, SOR_chunk_size, num_stripes, I0Mat.rows, dW_u, dW_v));
-            // compute all black vertices in parallel:
-            parallel_for_(Range(0, num_stripes),
-                          RedBlackSOR_ParBody(*this, false, SOR_chunk_size, num_stripes, I0Mat.rows, dW_u, dW_v));
+                          RedBlackSOR_ParBody(*this, num_stripes, I0Mat.rows, dW_u, dW_v, false));
         }
-        time = ((double)getTickCount() - startTick) / getTickFrequency();
-        time_SOR += time;
-        tempW_u = W_u + dW_u;
-        tempW_v = W_v + dW_v;
+
+        tempW_u.red = W_u_rb.red + dW_u.red;
+        tempW_u.black = W_u_rb.black + dW_u.black;
+        updateRepeatedBorders(tempW_u);
+        tempW_v.red = W_v_rb.red + dW_v.red;
+        tempW_v.black = W_v_rb.black + dW_v.black;
+        updateRepeatedBorders(tempW_v);
     }
-    tempW_u.copyTo(W_u);
-    tempW_v.copyTo(W_v);
+    mergeCheckerboard(W_u, tempW_u);
+    mergeCheckerboard(W_v, tempW_v);
 }
 void VariationalRefinementImpl::collectGarbage()
 {
@@ -924,10 +1227,6 @@ void VariationalRefinementImpl::collectGarbage()
     Iyy.release();
     Ixz.release();
     Iyz.release();
-
-    printf("    Data and smoothness terms: %.1f ms\n", 1000 * time_terms);
-    printf("    SOR: %.1f ms\n", 1000 * time_SOR);
-    printf("\n");
 }
 
 Ptr<VariationalRefinement> createVariationalFlowRefinement() { return makePtr<VariationalRefinementImpl>(); }

@@ -65,14 +65,9 @@ class DISOpticalFlowImpl : public DISOpticalFlow
     int patch_size;
     int patch_stride;
     int grad_descent_iter;
+    int variational_refinement_iter;
     int num_stripes;
     int border_size;
-
-  protected: // timings (temporary)
-    double time_structure_tensor_precomputation;
-    double time_inverse_search;
-    double time_densification;
-    double time_variational_refinement;
 
   public: // getters and setters
     int getFinestScale() const { return finest_scale; }
@@ -83,6 +78,8 @@ class DISOpticalFlowImpl : public DISOpticalFlow
     void setPatchStride(int val) { patch_stride = val; }
     int getGradientDescentIterations() const { return grad_descent_iter; }
     void setGradientDescentIterations(int val) { grad_descent_iter = val; }
+    int getVariationalRefinementIterations() const { return variational_refinement_iter; }
+    void setVariationalRefinementIterations(int val) { variational_refinement_iter = val; }
 
   protected:                     // internal buffers
     vector<Mat_<uchar>> I0s;     // gaussian pyramid for the current frame
@@ -143,17 +140,13 @@ class DISOpticalFlowImpl : public DISOpticalFlow
 
 DISOpticalFlowImpl::DISOpticalFlowImpl()
 {
-    finest_scale = 1;
+    finest_scale = 2;
     patch_size = 8;
-    patch_stride = 3;
-    grad_descent_iter = 12;
+    patch_stride = 4;
+    grad_descent_iter = 16;
+    variational_refinement_iter = 5;
     num_stripes = getNumThreads();
     border_size = 16;
-
-    time_structure_tensor_precomputation = 0.0;
-    time_inverse_search = 0.0;
-    time_densification = 0.0;
-    time_variational_refinement = 0.0;
 
     int max_possible_scales = 10;
     for (int i = 0; i < max_possible_scales; i++)
@@ -213,11 +206,13 @@ void DISOpticalFlowImpl::prepareBuffers(Mat &I0, Mat &I1)
             I0xs[i].create(cur_rows, cur_cols);
             I0ys[i].create(cur_rows, cur_cols);
             spatialGradient(I0s[i], I0xs[i], I0ys[i]);
-            // Sobel(I0s[i], I0xs[i], CV_16S, 1, 0, 1);
-            // Sobel(I0s[i], I0ys[i], CV_16S, 0, 1, 1);
             Ux[i].create(cur_rows, cur_cols);
             Uy[i].create(cur_rows, cur_cols);
-            variational_refinement_processors[i]->setFixedPointIterations(5*i + 5);
+            variational_refinement_processors[i]->setAlpha(20.0f);
+            variational_refinement_processors[i]->setDelta(5.0f);
+            variational_refinement_processors[i]->setGamma(10.0f);
+            variational_refinement_processors[i]->setSorIterations(5);
+            variational_refinement_processors[i]->setFixedPointIterations(variational_refinement_iter);
         }
     }
 }
@@ -330,111 +325,118 @@ DISOpticalFlowImpl::PatchGradientDescent_ParBody::PatchGradientDescent_ParBody(D
 // returns current SSD between patches
 // I0_ptr, I1_ptr - already point to patches
 // w00, w01, w10, w11 - bilinear interpolation weights
-inline float process8x8Patch(float &dst_dUx, float &dst_dUy, uchar *I0_ptr, uchar *I1_ptr, short *I0x_ptr,
-                             short *I0y_ptr, int I0_stride, int I1_stride, float w00, float w01, float w10, float w11)
+inline float processPatch(float &dst_dUx, float &dst_dUy, uchar *I0_ptr, uchar *I1_ptr, short *I0x_ptr,
+                          short *I0y_ptr, int I0_stride, int I1_stride, float w00, float w01, float w10, float w11, int patch_sz)
 {
     float SSD = 0.0f;
 #ifdef CV_SIMD128
-    // sum values:
-    v_float32x4 Ux_vec = v_setall_f32(0);
-    v_float32x4 Uy_vec = v_setall_f32(0);
-    v_float32x4 SSD_vec = v_setall_f32(0);
-
-    v_float32x4 w00v = v_setall_f32(w00);
-    v_float32x4 w01v = v_setall_f32(w01);
-    v_float32x4 w10v = v_setall_f32(w10);
-    v_float32x4 w11v = v_setall_f32(w11);
-
-    v_uint8x16 I0_row_16, I1_row_16, I1_row_shifted_16, I1_row_next_16, I1_row_next_shifted_16;
-    v_uint16x8 I0_row_8, I1_row_8, I1_row_shifted_8, I1_row_next_8, I1_row_next_shifted_8, tmp;
-    v_uint32x4 I0_row_4_left, I1_row_4_left, I1_row_shifted_4_left, I1_row_next_4_left, I1_row_next_shifted_4_left;
-    v_uint32x4 I0_row_4_right, I1_row_4_right, I1_row_shifted_4_right, I1_row_next_4_right, I1_row_next_shifted_4_right;
-
-    v_int16x8 I0x_row, I0y_row;
-    v_int32x4 I0x_row_4_left, I0x_row_4_right, I0y_row_4_left, I0y_row_4_right;
-    v_float32x4 I_diff;
-    v_int32x4 Ux_mul_left, Ux_mul_right, Uy_mul_left, Uy_mul_right;
-    v_int32x4 SSD_mul_left, SSD_mul_right;
-
-    // preprocess first row of I1:
-    I1_row_16 = v_load(I1_ptr);
-    I1_row_shifted_16 = v_extract<1, v_uint8x16>(I1_row_16, I1_row_16);
-    v_expand(I1_row_16, I1_row_8, tmp);
-    v_expand(I1_row_shifted_16, I1_row_shifted_8, tmp);
-    v_expand(I1_row_8, I1_row_4_left, I1_row_4_right);
-    v_expand(I1_row_shifted_8, I1_row_shifted_4_left, I1_row_shifted_4_right);
-    I1_ptr += I1_stride;
-
-    for (int row = 0; row < 8; row++)
+    if (patch_sz == 8)
     {
-        // load next row of I1:
-        I1_row_next_16 = v_load(I1_ptr);
-        // circular shift left by 1:
-        I1_row_next_shifted_16 = v_extract<1, v_uint8x16>(I1_row_next_16, I1_row_next_16);
-        // expand to 8 ushorts (we only need the first 8 values):
-        v_expand(I1_row_next_16, I1_row_next_8, tmp);
-        v_expand(I1_row_next_shifted_16, I1_row_next_shifted_8, tmp);
-        v_expand(I1_row_next_8, I1_row_next_4_left, I1_row_next_4_right);
-        v_expand(I1_row_next_shifted_8, I1_row_next_shifted_4_left, I1_row_next_shifted_4_right);
+        // sum values:
+        v_float32x4 Ux_vec = v_setall_f32(0);
+        v_float32x4 Uy_vec = v_setall_f32(0);
+        v_float32x4 SSD_vec = v_setall_f32(0);
 
-        // load current rows of I0, I0x, I0y:
-        I0_row_16 = v_load(I0_ptr);
-        v_expand(I0_row_16, I0_row_8, tmp);
-        v_expand(I0_row_8, I0_row_4_left, I0_row_4_right);
-        I0x_row = v_load(I0x_ptr);
-        v_expand(I0x_row, I0x_row_4_left, I0x_row_4_right);
-        I0y_row = v_load(I0y_ptr);
-        v_expand(I0y_row, I0y_row_4_left, I0y_row_4_right);
+        v_float32x4 w00v = v_setall_f32(w00);
+        v_float32x4 w01v = v_setall_f32(w01);
+        v_float32x4 w10v = v_setall_f32(w10);
+        v_float32x4 w11v = v_setall_f32(w11);
 
-        // difference of I0 row and bilinearly interpolated I1 row:
-        I_diff = w00v * v_cvt_f32(v_reinterpret_as_s32(I1_row_4_left)) +
-                 w01v * v_cvt_f32(v_reinterpret_as_s32(I1_row_shifted_4_left)) +
-                 w10v * v_cvt_f32(v_reinterpret_as_s32(I1_row_next_4_left)) +
-                 w11v * v_cvt_f32(v_reinterpret_as_s32(I1_row_next_shifted_4_left)) -
-                 v_cvt_f32(v_reinterpret_as_s32(I0_row_4_left));
-        Ux_vec += I_diff * v_cvt_f32(I0x_row_4_left);
-        Uy_vec += I_diff * v_cvt_f32(I0y_row_4_left);
-        SSD_vec += I_diff * I_diff;
+        v_uint8x16 I0_row_16, I1_row_16, I1_row_shifted_16, I1_row_next_16, I1_row_next_shifted_16;
+        v_uint16x8 I0_row_8, I1_row_8, I1_row_shifted_8, I1_row_next_8, I1_row_next_shifted_8, tmp;
+        v_uint32x4 I0_row_4_left, I1_row_4_left, I1_row_shifted_4_left, I1_row_next_4_left, I1_row_next_shifted_4_left;
+        v_uint32x4 I0_row_4_right, I1_row_4_right, I1_row_shifted_4_right, I1_row_next_4_right, I1_row_next_shifted_4_right;
 
-        I_diff = w00v * v_cvt_f32(v_reinterpret_as_s32(I1_row_4_right)) +
-                 w01v * v_cvt_f32(v_reinterpret_as_s32(I1_row_shifted_4_right)) +
-                 w10v * v_cvt_f32(v_reinterpret_as_s32(I1_row_next_4_right)) +
-                 w11v * v_cvt_f32(v_reinterpret_as_s32(I1_row_next_shifted_4_right)) -
-                 v_cvt_f32(v_reinterpret_as_s32(I0_row_4_right));
-        Ux_vec += I_diff * v_cvt_f32(I0x_row_4_right);
-        Uy_vec += I_diff * v_cvt_f32(I0y_row_4_right);
-        SSD_vec += I_diff * I_diff;
+        v_int16x8 I0x_row, I0y_row;
+        v_int32x4 I0x_row_4_left, I0x_row_4_right, I0y_row_4_left, I0y_row_4_right;
+        v_float32x4 I_diff;
+        v_int32x4 Ux_mul_left, Ux_mul_right, Uy_mul_left, Uy_mul_right;
+        v_int32x4 SSD_mul_left, SSD_mul_right;
 
-        I0_ptr += I0_stride;
-        I0x_ptr += I0_stride;
-        I0y_ptr += I0_stride;
+        // preprocess first row of I1:
+        I1_row_16 = v_load(I1_ptr);
+        I1_row_shifted_16 = v_extract<1, v_uint8x16>(I1_row_16, I1_row_16);
+        v_expand(I1_row_16, I1_row_8, tmp);
+        v_expand(I1_row_shifted_16, I1_row_shifted_8, tmp);
+        v_expand(I1_row_8, I1_row_4_left, I1_row_4_right);
+        v_expand(I1_row_shifted_8, I1_row_shifted_4_left, I1_row_shifted_4_right);
         I1_ptr += I1_stride;
 
-        I1_row_4_left = I1_row_next_4_left;
-        I1_row_4_right = I1_row_next_4_right;
-        I1_row_shifted_4_left = I1_row_next_shifted_4_left;
-        I1_row_shifted_4_right = I1_row_next_shifted_4_right;
-    }
-
-    // final reduce operations:
-    dst_dUx = v_reduce_sum(Ux_vec);
-    dst_dUy = v_reduce_sum(Uy_vec);
-    SSD = v_reduce_sum(SSD_vec);
-#else
-    dst_dUx = 0.0f;
-    dst_dUy = 0.0f;
-    float diff;
-    for (int i = 0; i < 8; i++)
-        for (int j = 0; j < 8; j++)
+        for (int row = 0; row < 8; row++)
         {
-            diff = w00 * I1_ptr[i * I1_stride + j] + w01 * I1_ptr[i * I1_stride + j + 1] +
-                   w10 * I1_ptr[(i + 1) * I1_stride + j] + w11 * I1_ptr[(i + 1) * I1_stride + j + 1] -
-                   I0_ptr[i * I0_stride + j];
+            // load next row of I1:
+            I1_row_next_16 = v_load(I1_ptr);
+            // circular shift left by 1:
+            I1_row_next_shifted_16 = v_extract<1, v_uint8x16>(I1_row_next_16, I1_row_next_16);
+            // expand to 8 ushorts (we only need the first 8 values):
+            v_expand(I1_row_next_16, I1_row_next_8, tmp);
+            v_expand(I1_row_next_shifted_16, I1_row_next_shifted_8, tmp);
+            v_expand(I1_row_next_8, I1_row_next_4_left, I1_row_next_4_right);
+            v_expand(I1_row_next_shifted_8, I1_row_next_shifted_4_left, I1_row_next_shifted_4_right);
 
-            SSD += diff * diff;
-            dst_dUx += diff * I0x_ptr[i * I0_stride + j];
-            dst_dUy += diff * I0y_ptr[i * I0_stride + j];
+            // load current rows of I0, I0x, I0y:
+            I0_row_16 = v_load(I0_ptr);
+            v_expand(I0_row_16, I0_row_8, tmp);
+            v_expand(I0_row_8, I0_row_4_left, I0_row_4_right);
+            I0x_row = v_load(I0x_ptr);
+            v_expand(I0x_row, I0x_row_4_left, I0x_row_4_right);
+            I0y_row = v_load(I0y_ptr);
+            v_expand(I0y_row, I0y_row_4_left, I0y_row_4_right);
+
+            // difference of I0 row and bilinearly interpolated I1 row:
+            I_diff = w00v * v_cvt_f32(v_reinterpret_as_s32(I1_row_4_left)) +
+                w01v * v_cvt_f32(v_reinterpret_as_s32(I1_row_shifted_4_left)) +
+                w10v * v_cvt_f32(v_reinterpret_as_s32(I1_row_next_4_left)) +
+                w11v * v_cvt_f32(v_reinterpret_as_s32(I1_row_next_shifted_4_left)) -
+                v_cvt_f32(v_reinterpret_as_s32(I0_row_4_left));
+            Ux_vec += I_diff * v_cvt_f32(I0x_row_4_left);
+            Uy_vec += I_diff * v_cvt_f32(I0y_row_4_left);
+            SSD_vec += I_diff * I_diff;
+
+            I_diff = w00v * v_cvt_f32(v_reinterpret_as_s32(I1_row_4_right)) +
+                w01v * v_cvt_f32(v_reinterpret_as_s32(I1_row_shifted_4_right)) +
+                w10v * v_cvt_f32(v_reinterpret_as_s32(I1_row_next_4_right)) +
+                w11v * v_cvt_f32(v_reinterpret_as_s32(I1_row_next_shifted_4_right)) -
+                v_cvt_f32(v_reinterpret_as_s32(I0_row_4_right));
+            Ux_vec += I_diff * v_cvt_f32(I0x_row_4_right);
+            Uy_vec += I_diff * v_cvt_f32(I0y_row_4_right);
+            SSD_vec += I_diff * I_diff;
+
+            I0_ptr += I0_stride;
+            I0x_ptr += I0_stride;
+            I0y_ptr += I0_stride;
+            I1_ptr += I1_stride;
+
+            I1_row_4_left = I1_row_next_4_left;
+            I1_row_4_right = I1_row_next_4_right;
+            I1_row_shifted_4_left = I1_row_next_shifted_4_left;
+            I1_row_shifted_4_right = I1_row_next_shifted_4_right;
         }
+
+        // final reduce operations:
+        dst_dUx = v_reduce_sum(Ux_vec);
+        dst_dUy = v_reduce_sum(Uy_vec);
+        SSD = v_reduce_sum(SSD_vec);
+    }
+    else
+    {
+#endif
+        dst_dUx = 0.0f;
+        dst_dUy = 0.0f;
+        float diff;
+        for (int i = 0; i < patch_sz; i++)
+            for (int j = 0; j < patch_sz; j++)
+            {
+                diff = w00 * I1_ptr[i * I1_stride + j] + w01 * I1_ptr[i * I1_stride + j + 1] +
+                    w10 * I1_ptr[(i + 1) * I1_stride + j] + w11 * I1_ptr[(i + 1) * I1_stride + j + 1] -
+                    I0_ptr[i * I0_stride + j];
+
+                SSD += diff * diff;
+                dst_dUx += diff * I0x_ptr[i * I0_stride + j];
+                dst_dUy += diff * I0y_ptr[i * I0_stride + j];
+            }
+#ifdef CV_SIMD128
+    }
 #endif
     return SSD;
 }
@@ -495,8 +497,8 @@ void DISOpticalFlowImpl::PatchGradientDescent_ParBody::operator()(const Range &r
                 float w01 = (floor(i_I1) + 1 - i_I1) * (j_I1 - floor(j_I1));
                 float w00 = (floor(i_I1) + 1 - i_I1) * (floor(j_I1) + 1 - j_I1);
 
-                float SSD = process8x8Patch(dUx, dUy, I0_ptr + i * w + j, I1_ptr + (int)i_I1 * w_ext + (int)j_I1,
-                                            I0x_ptr + i * w + j, I0y_ptr + i * w + j, w, w_ext, w00, w01, w10, w11);
+                float SSD = processPatch(dUx, dUy, I0_ptr + i * w + j, I1_ptr + (int)i_I1 * w_ext + (int)j_I1,
+                                         I0x_ptr + i * w + j, I0y_ptr + i * w + j, w, w_ext, w00, w01, w10, w11, psz);
                 cur_Ux -= invH11 * dUx + invH12 * dUy;
                 cur_Uy -= invH12 * dUx + invH22 * dUy;
                 if (SSD > prev_SSD)
@@ -590,7 +592,7 @@ void DISOpticalFlowImpl::Densification_ParBody::operator()(const Range &range) c
                            (j_u - j_m) * (i_m - i_l) * I1_ptr[i_u * w + j_l] +
                            (j_m - j_l) * (i_u - i_m) * I1_ptr[i_l * w + j_u] +
                            (j_u - j_m) * (i_u - i_m) * I1_ptr[i_l * w + j_l] - I0_ptr[i * w + j];
-                    coef = 1 / max(1.0f, diff * diff);
+                    coef = 1 / max(1.0f, abs(diff));
                     sum_Ux += coef * Sx_ptr[is * ws + js];
                     sum_Uy += coef * Sy_ptr[is * ws + js];
                     sum_coef += coef;
@@ -606,7 +608,6 @@ void DISOpticalFlowImpl::calc(InputArray I0, InputArray I1, InputOutputArray flo
     CV_Assert(!I0.empty() && I0.depth() == CV_8U && I0.channels() == 1);
     CV_Assert(!I1.empty() && I1.depth() == CV_8U && I1.channels() == 1);
     CV_Assert(I0.sameSize(I1));
-    CV_Assert(patch_size == 8); // currently support only 8x8 patches
 
     Mat I0Mat = I0.getMat();
     Mat I1Mat = I1.getMat();
@@ -619,31 +620,16 @@ void DISOpticalFlowImpl::calc(InputArray I0, InputArray I1, InputOutputArray flo
     Uy[coarsest_scale].setTo(0.0f);
 
     int hs;
-    double startTick, time;
     for (int i = coarsest_scale; i >= finest_scale; i--)
     {
-        startTick = (double)getTickCount();
         hs = 1 + (I0s[i].rows - patch_size) / patch_stride; // height of the sparse OF field
         precomputeStructureTensor(I0xx_buf, I0yy_buf, I0xy_buf, I0xs[i], I0ys[i]);
-        time = ((double)getTickCount() - startTick) / getTickFrequency();
-        time_structure_tensor_precomputation += time;
-
-        startTick = (double)getTickCount();
         parallel_for_(Range(0, num_stripes), PatchGradientDescent_ParBody(*this, num_stripes, hs, Sx, Sy, Ux[i], Uy[i],
                                                                           I0s[i], I1s_ext[i], I0xs[i], I0ys[i]));
-        time = ((double)getTickCount() - startTick) / getTickFrequency();
-        time_inverse_search += time;
-
-        startTick = (double)getTickCount();
         parallel_for_(Range(0, num_stripes),
                       Densification_ParBody(*this, num_stripes, I0s[i].rows, Ux[i], Uy[i], Sx, Sy, I0s[i], I1s[i]));
-        time = ((double)getTickCount() - startTick) / getTickFrequency();
-        time_densification += time;
-
-        startTick = (double)getTickCount();
-        variational_refinement_processors[i]->calcUV(I0s[i], I1s[i], Ux[i], Uy[i]);
-        time = ((double)getTickCount() - startTick) / getTickFrequency();
-        time_variational_refinement += time;
+        if(variational_refinement_iter>0)
+            variational_refinement_processors[i]->calcUV(I0s[i], I1s[i], Ux[i], Uy[i]);
 
         if (i > finest_scale)
         {
@@ -677,17 +663,38 @@ void DISOpticalFlowImpl::collectGarbage()
     I0yy_buf_aux.release();
     I0xy_buf_aux.release();
 
-    printf("Timings\n");
-    printf("  Precomputation: %.1f ms\n", 1000 * time_structure_tensor_precomputation);
-    printf("  Inverse search: %.1f ms\n", 1000 * time_inverse_search);
-    printf("  Densification: %.1f ms\n", 1000 * time_densification);
-    printf("  Variational refinement: %.1f ms\n", 1000 * time_variational_refinement);
-
     for (int i = finest_scale; i <= coarsest_scale; i++)
         variational_refinement_processors[i]->collectGarbage();
     variational_refinement_processors.clear();
 }
 
-Ptr<DISOpticalFlow> createOptFlow_DIS() { return makePtr<DISOpticalFlowImpl>(); }
+Ptr<DISOpticalFlow> createOptFlow_DIS(int preset) 
+{ 
+    Ptr<DISOpticalFlow> dis = makePtr<DISOpticalFlowImpl>();
+    dis->setPatchSize(8);
+    if (preset == DISOpticalFlow::PRESET_ULTRAFAST)
+    {
+        dis->setFinestScale(2);
+        dis->setPatchStride(4);
+        dis->setGradientDescentIterations(12);
+        dis->setVariationalRefinementIterations(0);
+    }
+    else if (preset == DISOpticalFlow::PRESET_FAST)
+    {
+        dis->setFinestScale(2);
+        dis->setPatchStride(4);
+        dis->setGradientDescentIterations(16);
+        dis->setVariationalRefinementIterations(5);
+    }
+    else if (preset == DISOpticalFlow::PRESET_MEDIUM)
+    {
+        dis->setFinestScale(1);
+        dis->setPatchStride(3);
+        dis->setGradientDescentIterations(20);
+        dis->setVariationalRefinementIterations(5);
+    }
+
+    return dis;
+}
 }
 }

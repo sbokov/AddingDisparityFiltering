@@ -1,92 +1,72 @@
 #!/usr/bin/env python
+from __future__ import print_function
 import os, sys, shutil
 import argparse
-import urllib2
-import zipfile
-import json
+import json, re
 from subprocess import check_output
 import datetime
 import matplotlib.pyplot as plt
 
 
-def fetch_url(url, target_dir):
-    file = os.path.join(target_dir, url.split('/')[-1])
-    u = urllib2.urlopen(url)
-    f = open(file, 'wb')
-    meta = u.info()
-    file_size = int(meta.getheaders("Content-Length")[0])
-    print "Downloading: %s Bytes: %s" % (file, file_size)
+def load_json(path):
+    f = open(path, "r")
+    data = json.load(f)
+    return data
 
-    file_size_dl = 0
-    block_sz = 16384
-    while True:
-        buffer = u.read(block_sz)
-        if not buffer:
-            break
-        file_size_dl += len(buffer)
-        f.write(buffer)
-        status = r"%10d  [%3.2f%%]" % (file_size_dl, file_size_dl * 100. /
-                                       file_size)
-        status = status + chr(8) * (len(status) + 1)
-        print status,
+
+def save_json(obj, path):
+    tmp_file = path + ".bak"
+    f = open(tmp_file, "w")
+    json.dump(obj, f, indent=2)
+    f.flush()
+    os.fsync(f.fileno())
     f.close()
-    return file
+    try:
+        os.rename(tmp_file, path)
+    except:
+        os.remove(path)
+        os.rename(tmp_file, path)
 
 
-def unzip_file(file, target_dir):
-    f = open(file, 'rb')
-    print "Unzipping: %s" % file
-    z = zipfile.ZipFile(f)
-    for name in z.namelist():
-        z.extract(name, target_dir)
-    f.close()
-    os.remove(file)
+def parse_evaluation_result(input_str, i):
+    res = {}
+    res['frame_number'] = i + 1
+    res['error'] = {}
+    regex = "([A-Za-z. \\[\\].0-9]+):[ ]*([0-9]*\.[0-9]+|[0-9]+)"
+    for elem in re.findall(regex,input_str):
+        if "Time" in elem[0]:
+            res['time'] = float(elem[1])
+        elif "Average" in elem[0]:
+            res['error']['average'] = float(elem[1])
+        elif "deviation" in elem[0]:
+            res['error']['std'] = float(elem[1])
+        else:
+            res['error'][elem[0]] = float(elem[1])
+    return res
 
 
-def evaluate_sequence(sequence, algorithm, executable, percent, img_files,
-                      gt_files):
+def evaluate_sequence(sequence, algorithm, dataset, executable, img_files, gt_files,
+                      state, state_path):
+    if "eval_results" not in state[dataset][algorithm][-1].keys():
+        state[dataset][algorithm][-1]["eval_results"] = {}
+    elif sequence in state[dataset][algorithm][-1]["eval_results"].keys():
+        return
+
     res = []
     for i in range(len(img_files) - 1):
         sys.stdout.write("Algorithm: %-20s Sequence: %-10s Done: [%3d/%3d]\r" %
                          (algorithm, sequence, i, len(img_files) - 1)),
         sys.stdout.flush()
-        if int(percent * i) != int(percent * (i + 1)):
-            res_string = check_output([executable, img_files[i], img_files[i + 1],
-                                       algorithm, gt_files[i]])
-            res.append(parse_evaluation_result(res_string, i))
-    return res
 
-
-def parse_evaluation_result(input_str, i):
-    res = {}
-    lines = input_str.split('\n')
-    res['frame_number'] = i + 1
-    res['time'] = float(lines[1].split(':')[1])
-    res['error'] = {}
-    res['error']['average'] = float(lines[3].split(':')[1])
-    res['error']['std'] = float(lines[4].split(':')[1])
-    res['error']['R0.5'] = float(lines[5][:-2].split(':')[1])
-    res['error']['R1.0'] = float(lines[6][:-2].split(':')[1])
-    res['error']['R2.0'] = float(lines[7][:-2].split(':')[1])
-    res['error']['R5.0'] = float(lines[8][:-2].split(':')[1])
-    res['error']['R10.0'] = float(lines[9][:-2].split(':')[1])
-    res['error']['A0.50'] = float(lines[10].split(':')[1])
-    res['error']['A0.75'] = float(lines[11].split(':')[1])
-    res['error']['A0.95'] = float(lines[12].split(':')[1])
-    return res
-
+        res_string = check_output([executable, img_files[i], img_files[i + 1],
+                                   algorithm, gt_files[i]])
+        res.append(parse_evaluation_result(res_string, i))
+    state[dataset][algorithm][-1]["eval_results"][sequence] = res
+    save_json(state, state_path)
 
 #############################DATSET DEFINITIONS################################
-def fetch_mpi_sintel(target_dir):
-    for url in [
-            "http://files.is.tue.mpg.de/sintel/MPI-Sintel-training_images.zip",
-            "http://files.is.tue.mpg.de/sintel/MPI-Sintel-training_extras.zip"
-    ]:
-        file = fetch_url(url, target_dir)
-        unzip_file(file, os.path.join(target_dir, 'mpi_sintel'))
 
-
-def evaluate_mpi_sintel(source_dir, algorithm, evaluation_executable, percent):
+def evaluate_mpi_sintel(source_dir, algorithm, evaluation_executable, state, state_path):
     evaluation_result = {}
     img_dir = os.path.join(source_dir, 'mpi_sintel', 'training', 'final')
     gt_dir = os.path.join(source_dir, 'mpi_sintel', 'training', 'flow')
@@ -99,22 +79,12 @@ def evaluate_mpi_sintel(source_dir, algorithm, evaluation_executable, percent):
         gt_files = sorted([os.path.join(gt_dir, seq, f)
                            for f in os.listdir(os.path.join(gt_dir, seq))
                            if f.endswith(".flo")])
-        evaluation_result[seq] = evaluate_sequence(
-            seq, algorithm, evaluation_executable, percent, img_files,
-            gt_files)
+        evaluation_result[seq] = evaluate_sequence(seq, algorithm, 'mpi_sintel',
+            evaluation_executable, img_files, gt_files, state, state_path)
     return evaluation_result
 
 
-def fetch_middlebury(target_dir):
-    for url in [
-            "http://vision.middlebury.edu/flow/data/comp/zip/other-color-twoframes.zip",
-            "http://vision.middlebury.edu/flow/data/comp/zip/other-gt-flow.zip"
-    ]:
-        file = fetch_url(url, target_dir)
-        unzip_file(file, os.path.join(target_dir, 'middlebury'))
-
-
-def evaluate_middlebury(source_dir, algorithm, evaluation_executable, percent):
+def evaluate_middlebury(source_dir, algorithm, evaluation_executable, state, state_path):
     evaluation_result = {}
     img_dir = os.path.join(source_dir, 'middlebury', 'other-data')
     gt_dir = os.path.join(source_dir, 'middlebury', 'other-gt-flow')
@@ -127,35 +97,17 @@ def evaluate_middlebury(source_dir, algorithm, evaluation_executable, percent):
         gt_files = sorted([os.path.join(gt_dir, seq, f)
                            for f in os.listdir(os.path.join(gt_dir, seq))
                            if f.endswith(".flo")])
-        evaluation_result[seq] = evaluate_sequence(
-            seq, algorithm, evaluation_executable, 1.0, img_files, gt_files)
+        evaluation_result[seq] = evaluate_sequence(seq, algorithm, 'middlebury',
+            evaluation_executable, img_files, gt_files, state, state_path)
     return evaluation_result
 
 
-datasets = {
-    "mpi_sintel": {
-        "fetch_function": fetch_mpi_sintel,
-        "evaluate_function": evaluate_mpi_sintel
-    },
-    "middlebury": {
-        "fetch_function": fetch_middlebury,
-        "evaluate_function": evaluate_middlebury
-    }
+dataset_eval_functions = {
+    "mpi_sintel": evaluate_mpi_sintel,
+    "middlebury": evaluate_middlebury
 }
 
 ###############################################################################
-
-
-def load_json(path):
-    f = open(path, "r")
-    data = json.load(f)
-    return data
-
-
-def save_json(obj, path):
-    f = open(path, "w")
-    json.dump(obj, f, indent=2)
-
 
 def create_dir(dir):
     if not os.path.exists(dir):
@@ -169,77 +121,46 @@ def parse_sequence(input_str):
         return [o.strip() for o in input_str.split(",") if o]
 
 
-def build_chart(dst_folder, src_folder, percent, dataset):
+def build_chart(dst_folder, state, dataset):
     fig = plt.figure(figsize=(16, 10))
-    src_files = [os.path.join(src_folder, f) for f in os.listdir(src_folder)
-                 if f.endswith(".json")]
     markers = ["o", "s", "h", "^", "D"]
     marker_idx = 0
     colors = ["b", "g", "r"]
     color_idx = 0
-    x_line1 = []
-    y_line1 = []
-    line_name1 = ""
-    x_line2 = []
-    y_line2 = []
-    line_name2 = ""
-    for file in src_files:
-        data = load_json(file)
-        name = os.path.basename(file).split('.')[0]
-        average_time = 0.0
-        average_error = 0.0
-        num_elem = 0
-        for seq in data.keys():
-            for frame in data[seq]:
-                average_time += frame["time"]
-                average_error += frame["error"]["average"]
-                num_elem += 1
-        average_time /= num_elem
-        average_error /= num_elem
+    for algo in state[dataset].keys():
+        for eval_instance in state[dataset][algo]:
+            name = algo + "--" + eval_instance["timestamp"]
+            average_time = 0.0
+            average_error = 0.0
+            num_elem = 0
+            for seq in eval_instance["eval_results"].keys():
+                for frame in eval_instance["eval_results"][seq]:
+                    average_time += frame["time"]
+                    average_error += frame["error"]["average"]
+                    num_elem += 1
+            average_time /= num_elem
+            average_error /= num_elem
 
-        marker_style = colors[color_idx] + markers[marker_idx]
-        color_idx += 1
-        if color_idx >= len(colors):
-            color_idx = 0
-        marker_idx += 1
-        if marker_idx >= len(markers):
-            marker_idx = 0
-        if "DISflow--2016-06-06" in file:
-            x_line1.append(average_time)
-            y_line1.append(average_error)
-            line_name1 = name
-        elif "DISflow--2016-06-08" in file:
-            x_line2.append(average_time)
-            y_line2.append(average_error)
-            line_name2 = name
-        else:
+            marker_style = colors[color_idx] + markers[marker_idx]
+            color_idx += 1
+            if color_idx >= len(colors):
+                color_idx = 0
+            marker_idx += 1
+            if marker_idx >= len(markers):
+                marker_idx = 0
             plt.gca().plot([average_time], [average_error],
                            marker_style,
                            markersize=14,
                            label=name)
-    plt.gca().plot(x_line1, y_line1,
-                           'ro' + "-",
-                           markersize=14,
-                           label=line_name1)
-    plt.gca().plot(x_line2, y_line2,
-                           'gh' + "-",
-                           markersize=14,
-                           label=line_name2)
-        
+
     plt.gca().set_ylabel('Average Endpoint Error (EPE)', fontsize=20)
     plt.gca().set_xlabel('Average Runtime (seconds per frame)', fontsize=20)
     plt.gca().set_xscale("log")
-    if int(percent) == 100:
-        plt.gca().set_title('Evaluation on ' + dataset, fontsize=20)
-    else:
-        plt.gca().set_title(
-            'Evaluation on ' + dataset + ' (' + percent + '% of all frames)',
-            fontsize=20)
+    plt.gca().set_title('Evaluation on ' + dataset, fontsize=20)
+
     plt.gca().legend()
-    fig.savefig(
-        os.path.join(dst_folder, "evaluation_results_" + dataset + "_p" +
-                     percent + ".png"),
-        bbox_inches='tight')
+    fig.savefig(os.path.join(dst_folder, "evaluation_results_" + dataset + ".png"),
+                bbox_inches='tight')
     plt.close()
 
 
@@ -249,79 +170,99 @@ if __name__ == '__main__':
         formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument(
         "bin_path",
-        default=".",
-        help="""Path to the directory with built samples (should contain
-                optflow-example-optical_flow_evaluation)""")
+        default="./optflow-example-optical_flow_evaluation",
+        help="Path to the optical flow evaluation executable")
     parser.add_argument(
         "-a",
         "--algorithms",
         metavar="ALGORITHMS",
         default="",
-        help="""Comma-separated list of optical-flow algorithms to evaluate
-                (example: -a farneback,tvl1,deepflow). Note that previously
-                evaluated algorithms are also included in the output charts""")
+        help=("Comma-separated list of optical-flow algorithms to evaluate "
+              "(example: -a farneback,tvl1,deepflow). Note that previously "
+              "evaluated algorithms are also included in the output charts"))
     parser.add_argument(
         "-d",
         "--datasets",
         metavar="DATASETS",
         default="mpi_sintel",
-        help="""Comma-separated list of datasets for evaluation (currently only
-                'mpi_sintel' and 'middlebury' are supported)""")
+        help=("Comma-separated list of datasets for evaluation (currently only "
+              "'mpi_sintel' and 'middlebury' are supported)"))
     parser.add_argument(
-        "-w",
-        "--cwd",
-        metavar="WORKING_DIR",
-        default="./OF_evaluation_data",
-        help="Working directory for storing datasets and intermediate results")
+        "-f",
+        "--dataset_folder",
+        metavar="DATASET_FOLDER",
+        default="./OF_datasets",
+        help=("Path to a folder containing datasets. To enable evaluation on "
+              "MPI Sintel dataset, please download it using the following links: "
+              "http://files.is.tue.mpg.de/sintel/MPI-Sintel-training_images.zip and "
+              "http://files.is.tue.mpg.de/sintel/MPI-Sintel-training_extras.zip and "
+              "unzip these archives into the 'mpi_sintel' folder. To enable evaluation "
+              "on the Middlebury dataset use the following links: "
+              "http://vision.middlebury.edu/flow/data/comp/zip/other-color-twoframes.zip, "
+              "http://vision.middlebury.edu/flow/data/comp/zip/other-gt-flow.zip. "
+              "These should be unzipped into 'middlebury' folder"))
     parser.add_argument(
         "-o",
         "--out",
         metavar="OUT_DIR",
         default="./OF_evaluation_results",
-        help="Output directory where to store benchmark results (comparative charts)")
+        help="Output directory where to store benchmark results")
     parser.add_argument(
-        "-p",
-        "--percent",
-        metavar="PERCENT",
-        default="100",
-        help="""Percent of the dataset to consider (the lower this value is the faster
-                the evaluation will finish; it, however, naturally decreases the
-                evaluation accuracy)""")
+        "-s",
+        "--state",
+        metavar="STATE_JSON",
+        default="./OF_evaluation_state.json",
+        help=("Path to a json file that stores the current evaluation state and "
+              "previous evaluation results"))
     args, other_args = parser.parse_known_args()
 
-    create_dir(args.cwd)
-    current_state = {"fetched_datasets": []}
-    if os.path.isfile(os.path.join(args.cwd, "state.json")):
-        current_state = load_json(os.path.join(args.cwd, "state.json"))
+    if not os.path.isfile(args.bin_path):
+        print("Error: " + args.bin_path + " does not exist")
+        sys.exit(1)
+
+    if not os.path.exists(args.dataset_folder):
+        print("Error: " + args.dataset_folder + (" does not exist. Please, correctly "
+                                                 "specify the -f parameter"))
+        sys.exit(1)
+
+    state = {}
+    if os.path.isfile(args.state):
+        state = load_json(args.state)
 
     algorithm_list = parse_sequence(args.algorithms)
     dataset_list = parse_sequence(args.datasets)
     for dataset in dataset_list:
-        if dataset not in datasets.keys():
-            print "Error: unsupported dataset " + dataset
+        if dataset not in dataset_eval_functions.keys():
+            print("Error: unsupported dataset " + dataset)
             sys.exit(1)
-        if dataset not in current_state["fetched_datasets"]:
-            datasets[dataset]["fetch_function"](args.cwd)
-            current_state["fetched_datasets"].append(dataset)
-            save_json(current_state, os.path.join(args.cwd, "state.json"))
+        if dataset not in os.listdir(args.dataset_folder):
+            print("Error: " + os.path.join(args.dataset_folder, dataset) + (" does not exist. "
+                              "Please, download the dataset and follow the naming conventions "
+                              "(use -h for more information)"))
+            sys.exit(1)
 
-    create_dir(os.path.join(args.cwd, 'evaluation_results'))
     for dataset in dataset_list:
-        create_dir(os.path.join(args.cwd, 'evaluation_results', dataset))
-        create_dir(os.path.join(args.cwd, 'evaluation_results', dataset, 'p' +
-                                str(args.percent)))
+        if dataset not in state.keys():
+            state[dataset] = {}
         for algorithm in algorithm_list:
-            eval_res = datasets[dataset]["evaluate_function"](
-                args.cwd, algorithm, os.path.join(
-                    args.bin_path, 'optflow-example-optical_flow_evaluation'),
-                float(args.percent) / 100)
-            save_json(eval_res, os.path.join(
-                args.cwd, 'evaluation_results', dataset, 'p' + str(args.percent),
-                algorithm + datetime.datetime.now().strftime("--%Y-%m-%d--%H-%M") +
-                ".json"))
+            if algorithm in state[dataset].keys():
+                last_eval_instance = state[dataset][algorithm][-1]
+                if "finished" not in last_eval_instance.keys():
+                    print(("Continuing an unfinished evaluation of " +
+                          algorithm + " started at " + last_eval_instance["timestamp"]))
+                else:
+                    state[dataset][algorithm].append({"timestamp":
+                        datetime.datetime.now().strftime("%Y-%m-%d--%H-%M")})
+            else:
+                state[dataset][algorithm] = [{"timestamp":
+                    datetime.datetime.now().strftime("%Y-%m-%d--%H-%M")}]
+            save_json(state, args.state)
+            dataset_eval_functions[dataset](args.dataset_folder, algorithm, args.bin_path,
+                                            state, args.state)
+            state[dataset][algorithm][-1]["finished"] = True
+            save_json(state, args.state)
+    save_json(state, args.state)
 
     create_dir(args.out)
     for dataset in dataset_list:
-        build_chart(args.out, os.path.join(args.cwd, 'evaluation_results',
-                                           dataset, 'p' + str(args.percent)),
-                    args.percent, dataset)
+        build_chart(args.out, state, dataset)

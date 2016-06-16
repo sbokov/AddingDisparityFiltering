@@ -156,8 +156,13 @@ CV_EXPORTS_W bool writeOpticalFlow( const String& path, InputArray flow );
 
 /** @brief Variational optical flow refinement
 
-This class implements variational refinement of the input flow field.
-TODO: Add more details
+This class implements variational refinement of the input flow field, i.e. 
+it uses input flow to initialize the minimization of the following functional:
+\f$E(U) = \int_{\Omega} \delta \Psi(E_I) + \gamma \Psi(E_G) + \alpha \Psi(E_S) \f$,
+where \f$E_I,E_G,E_S\f$ are color constancy, gradient constancy and smoothness terms
+respectively. \f$\Psi(s^2)=\sqrt{s^2+\epsilon^2}\f$ is a robust penalizer to limit the 
+influence of outliers. A complete formulation and a description of the minimization 
+procedure can be found in @cite Brox2004
 */
 class CV_EXPORTS_W VariationalRefinement : public DenseOpticalFlow
 {
@@ -166,41 +171,42 @@ public:
     (to avoid extra splits/merges) */
     CV_WRAP virtual void calcUV(InputArray I0, InputArray I1, InputOutputArray flow_u, InputOutputArray flow_v) = 0;
 
-    /** @brief 
+    /** @brief Number of outer (fixed-point) iterations in the minimization procedure.
     @see setFixedPointIterations */
-    virtual int getFixedPointIterations() const = 0;
+    CV_WRAP virtual int getFixedPointIterations() const = 0;
     /** @copybrief getFixedPointIterations @see getFixedPointIterations */
-    virtual void setFixedPointIterations(int val) = 0;
+    CV_WRAP virtual void setFixedPointIterations(int val) = 0;
 
-    /** @brief 
+    /** @brief Number of inner successive over-relaxation (SOR) iterations 
+        in the minimization procedure to solve the respective linear system.
     @see setSorIterations */
-    virtual int getSorIterations() const = 0;
+    CV_WRAP virtual int getSorIterations() const = 0;
     /** @copybrief getSorIterations @see getSorIterations */
-    virtual void setSorIterations(int val) = 0;
+    CV_WRAP virtual void setSorIterations(int val) = 0;
 
-    /** @brief 
+    /** @brief Relaxation factor in SOR
     @see setOmega */
-    virtual float getOmega() const = 0;
+    CV_WRAP virtual float getOmega() const = 0;
     /** @copybrief getOmega @see getOmega */
-    virtual void setOmega(float val) = 0;
+    CV_WRAP virtual void setOmega(float val) = 0;
 
-    /** @brief
+    /** @brief Weight of the smoothness term
     @see setAlpha */
-    virtual float getAlpha() const = 0;
+    CV_WRAP virtual float getAlpha() const = 0;
     /** @copybrief getAlpha @see getAlpha */
-    virtual void setAlpha(float val) = 0;
+    CV_WRAP virtual void setAlpha(float val) = 0;
 
-    /** @brief 
+    /** @brief Weight of the color constancy term
     @see setDelta */
-    virtual float getDelta() const = 0;
+    CV_WRAP virtual float getDelta() const = 0;
     /** @copybrief getDelta @see getDelta */
-    virtual void setDelta(float val) = 0;
+    CV_WRAP virtual void setDelta(float val) = 0;
 
-    /** @brief
+    /** @brief Weight of the gradient constance term
     @see setGamma */
-    virtual float getGamma() const = 0;
+    CV_WRAP virtual float getGamma() const = 0;
     /** @copybrief getGamma @see getGamma */
-    virtual void setGamma(float val) = 0;
+    CV_WRAP virtual void setGamma(float val) = 0;
 };
 
 /** @brief Creates an instance of VariationalRefinement
@@ -246,40 +252,62 @@ CV_EXPORTS_W Ptr<DenseOpticalFlow> createOptFlow_SparseToDense();
 /** @brief DIS optical flow algorithm.
 
 This class implements the Dense Inverse Search (DIS) optical flow algorithm. More
-details about the algorithm can be found at @cite Kroeger2016 .
+details about the algorithm can be found at @cite Kroeger2016 . Includes three presets with preselected 
+parameters to provide reasonable trade-off between speed and quality. However, even the slowest preset is 
+still relatively fast, use DeepFlow if you need better quality and don't care about speed.
 */
 class CV_EXPORTS_W DISOpticalFlow : public DenseOpticalFlow
 {
 public:
+    enum
+    {
+        PRESET_ULTRAFAST = 0,
+        PRESET_FAST = 1,
+        PRESET_MEDIUM = 2
+    };
+
     /** @brief Finest level of the gaussian pyramid on which the flow is computed (zero level
-        corresponds to the original image resolution).The final flow is obtained by bilinear upscaling.
+        corresponds to the original image resolution). The final flow is obtained by bilinear upscaling.
         @see setFinestScale */
     CV_WRAP virtual int getFinestScale() const = 0;
     /** @copybrief getFinestScale @see getFinestScale */
     CV_WRAP virtual void setFinestScale(int val) = 0;
 
-    /** @brief Size of an image patch for matching (in pixels)
+    /** @brief Size of an image patch for matching (in pixels). Normally, default 8x8 patches work well 
+        enough in most cases.
         @see setPatchSize */
-    virtual int getPatchSize() const = 0;
+    CV_WRAP virtual int getPatchSize() const = 0;
     /** @copybrief getPatchSize @see getPatchSize */
-    virtual void setPatchSize(int val) = 0;
+    CV_WRAP virtual void setPatchSize(int val) = 0;
 
-    /** @brief Stride between neighbor patches. Must be less than patch size.
+    /** @brief Stride between neighbor patches. Must be less than patch size. Lower values correspond 
+        to higher flow quality.
         @see setPatchStride */
-    virtual int getPatchStride() const = 0;
+    CV_WRAP virtual int getPatchStride() const = 0;
     /** @copybrief getPatchStride @see getPatchStride */
-    virtual void setPatchStride(int val) = 0;
+    CV_WRAP virtual void setPatchStride(int val) = 0;
 
-    /** @brief number of gradient descent iterations in the patch inverse search stage
+    /** @brief Number of gradient descent iterations in the patch inverse search stage. Higher values may 
+        improve quality in some cases.
         @see setGradientDescentIterations */
-    virtual int getGradientDescentIterations() const = 0;
+    CV_WRAP virtual int getGradientDescentIterations() const = 0;
     /** @copybrief getGradientDescentIterations @see getGradientDescentIterations */
-    virtual void setGradientDescentIterations(int val) = 0;
+    CV_WRAP virtual void setGradientDescentIterations(int val) = 0;
+
+    /** @brief Number of fixed point iterations of variational refinement per scale. Set to zero to 
+        disable variational refinement completely. Higher values will typically result in more smooth and 
+        high-quality flow.
+    @see setGradientDescentIterations */
+    CV_WRAP virtual int getVariationalRefinementIterations() const = 0;
+    /** @copybrief getGradientDescentIterations @see getGradientDescentIterations */
+    CV_WRAP virtual void setVariationalRefinementIterations(int val) = 0;
 };
 
 /** @brief Creates an instance of DISOpticalFlow
+
+@param preset one of PRESET_ULTRAFAST, PRESET_FAST and PRESET_MEDIUM
 */
-CV_EXPORTS_W Ptr<DISOpticalFlow> createOptFlow_DIS();
+CV_EXPORTS_W Ptr<DISOpticalFlow> createOptFlow_DIS(int preset = DISOpticalFlow::PRESET_FAST);
 
 //! @}
 

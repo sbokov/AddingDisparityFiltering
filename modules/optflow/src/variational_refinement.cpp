@@ -58,13 +58,13 @@ class VariationalRefinementImpl : public VariationalRefinement
     void calcUV(InputArray I0, InputArray I1, InputOutputArray flow_u, InputOutputArray flow_v);
     void collectGarbage();
 
-  protected: // algorithm parameters
+  protected: //!< algorithm parameters
     int fixedPointIterations, sorIterations;
     float omega;
     float alpha, delta, gamma;
     float zeta, epsilon;
 
-  public: // getters and setters
+  public:
     int getFixedPointIterations() const { return fixedPointIterations; }
     void setFixedPointIterations(int val) { fixedPointIterations = val; }
     int getSorIterations() const { return sorIterations; }
@@ -78,74 +78,76 @@ class VariationalRefinementImpl : public VariationalRefinement
     float getGamma() const { return gamma; }
     void setGamma(float val) { gamma = val; }
 
-  protected: // internal buffers
+  protected: //!< internal buffers
+    /* This struct defines a special data layout for Mat_<float>. Original buffer is split into two: one for "red"
+     * elements (sum of indices is even) and one for "black" (sum of indeces is odd) in a checkerboard pattern. It
+     * allows for more efficient processing in SOR iterations, more natural SIMD vectorization and parallelization
+     * (Red-Black SOR). Additionally, it simplifies border handling by adding repeated borders to both red and
+     * black buffers.
+     */
     struct RedBlackBuffer
     {
-        // special data layout (separate storage of "red" and "black" elements),
-        // more SIMD-friendly and easier to parallelize
-        // uses padding to simplify border processing
-        Mat_<float> red;   // (i+j)%2==0
-        Mat_<float> black; // (i+j)%2==1
+        Mat_<float> red;   //!< (i+j)%2==0
+        Mat_<float> black; //!< (i+j)%2==1
 
-        // can be different if width%2==1:
+        /* Width of even and odd rows may be different */
         int red_even_len, red_odd_len;
         int black_even_len, black_odd_len;
 
         void create(Size s);
         void release();
     };
-    Mat_<float> Ix, Iy, Iz, Ixx, Ixy, Iyy, Ixz, Iyz; // image derivatives
-    RedBlackBuffer Ix_rb, Iy_rb, Iz_rb, Ixx_rb, Ixy_rb, Iyy_rb, Ixz_rb, Iyz_rb;
-    RedBlackBuffer A11, A12, A22, b1, b2; // linear system coefficients
-    RedBlackBuffer weights;               // smoothness term weights in the current fixed point iteration
 
-    Mat_<float> mapX, mapY; // auxiliary buffers for remapping
+    Mat_<float> Ix, Iy, Iz, Ixx, Ixy, Iyy, Ixz, Iyz;                            //!< image derivative buffers
+    RedBlackBuffer Ix_rb, Iy_rb, Iz_rb, Ixx_rb, Ixy_rb, Iyy_rb, Ixz_rb, Iyz_rb; //!< corresponding red-black buffers
 
-    RedBlackBuffer tempW_u, tempW_v; // flow version that is modified in each fixed point iteration
-    RedBlackBuffer dW_u, dW_v;       // optical flow increment
-    RedBlackBuffer W_u_rb, W_v_rb;   // split version of the input flow
+    RedBlackBuffer A11, A12, A22, b1, b2; //!< main linear system coefficients
+    RedBlackBuffer weights;               //!< smoothness term weights in the current fixed point iteration
 
-  private: // private methods
+    Mat_<float> mapX, mapY; //!< auxiliary buffers for remapping
+
+    RedBlackBuffer tempW_u, tempW_v; //!< flow buffers that are modified in each fixed point iteration
+    RedBlackBuffer dW_u, dW_v;       //!< optical flow increment
+    RedBlackBuffer W_u_rb, W_v_rb;   //!< red-black-buffer version of the input flow
+
+  private: //!< private methods and parallel sections
     void splitCheckerboard(RedBlackBuffer &dst, Mat &src);
     void mergeCheckerboard(Mat &dst, RedBlackBuffer &src);
     void updateRepeatedBorders(RedBlackBuffer &dst);
-    void warpImage(Mat &dst, const Mat &src, const Mat &flow_u, const Mat &flow_v);
-    void prepareBuffers(const Mat &I0, const Mat &I1, const Mat &W_u, const Mat &W_v);
+    void warpImage(Mat &dst, Mat &src, Mat &flow_u, Mat &flow_v);
+    void prepareBuffers(Mat &I0, Mat &I1, Mat &W_u, Mat &W_v);
 
-    typedef void (VariationalRefinementImpl::*Op)(void* op1, void* op2, void* op3);
-
+    /* Parallelizing arbitrary operations with 3 input/output arguments */
+    typedef void (VariationalRefinementImpl::*Op)(void *op1, void *op2, void *op3);
     struct ParallelOp_ParBody : public ParallelLoopBody
     {
-        VariationalRefinementImpl* var;
+        VariationalRefinementImpl *var;
         vector<Op> ops;
-        vector<void*> op1s;
-        vector<void*> op2s;
-        vector<void*> op3s;
+        vector<void *> op1s;
+        vector<void *> op2s;
+        vector<void *> op3s;
 
-        ParallelOp_ParBody(VariationalRefinementImpl& _var, vector<Op> _ops, vector<void*>& _op1s, vector<void*>& _op2s, vector<void*>& _op3s);
-        void operator () (const Range& range) const;
+        ParallelOp_ParBody(VariationalRefinementImpl &_var, vector<Op> _ops, vector<void *> &_op1s,
+                           vector<void *> &_op2s, vector<void *> &_op3s);
+        void operator()(const Range &range) const;
     };
-
-    void gradHorizAndSplitOp(void* src, void* dst, void* dst_split)
+    void gradHorizAndSplitOp(void *src, void *dst, void *dst_split)
     {
-        Sobel(*(Mat*)src, *(Mat*)dst, -1, 1, 0, 1, 1, 0.00, BORDER_REPLICATE);
-        splitCheckerboard(*(RedBlackBuffer*)dst_split, *(Mat*)dst);
+        Sobel(*(Mat *)src, *(Mat *)dst, -1, 1, 0, 1, 1, 0.00, BORDER_REPLICATE);
+        splitCheckerboard(*(RedBlackBuffer *)dst_split, *(Mat *)dst);
     }
-
-    void gradVertAndSplitOp(void* src, void* dst, void* dst_split)
+    void gradVertAndSplitOp(void *src, void *dst, void *dst_split)
     {
-        Sobel(*(Mat*)src, *(Mat*)dst, -1, 0, 1, 1, 1, 0.00, BORDER_REPLICATE);
-        splitCheckerboard(*(RedBlackBuffer*)dst_split, *(Mat*)dst);
+        Sobel(*(Mat *)src, *(Mat *)dst, -1, 0, 1, 1, 1, 0.00, BORDER_REPLICATE);
+        splitCheckerboard(*(RedBlackBuffer *)dst_split, *(Mat *)dst);
     }
-
-    void averageOp(void* src1, void* src2, void* dst)
+    void averageOp(void *src1, void *src2, void *dst)
     {
-        addWeighted(*(Mat*)src1, 0.5, *(Mat*)src2, 0.5, 0.0, *(Mat*)dst, CV_32F);
+        addWeighted(*(Mat *)src1, 0.5, *(Mat *)src2, 0.5, 0.0, *(Mat *)dst, CV_32F);
     }
-
-    void subtractOp(void* src1, void* src2, void* dst)
+    void subtractOp(void *src1, void *src2, void *dst)
     {
-        subtract(*(Mat*)src1, *(Mat*)src2, *(Mat*)dst, noArray(), CV_32F);
+        subtract(*(Mat *)src1, *(Mat *)src2, *(Mat *)dst, noArray(), CV_32F);
     }
 
     struct ComputeDataTerm_ParBody : public ParallelLoopBody
@@ -169,9 +171,9 @@ class VariationalRefinementImpl : public VariationalRefinement
         int h;
         bool red_pass;
 
-        ComputeSmoothnessTermHorPass_ParBody(VariationalRefinementImpl &_var, int _nstripes, int _h, RedBlackBuffer &W_u,
-                                             RedBlackBuffer &_W_v, RedBlackBuffer &_tempW_u, RedBlackBuffer &_tempW_v,
-                                             bool _red_pass);
+        ComputeSmoothnessTermHorPass_ParBody(VariationalRefinementImpl &_var, int _nstripes, int _h,
+                                             RedBlackBuffer &W_u, RedBlackBuffer &_W_v, RedBlackBuffer &_tempW_u,
+                                             RedBlackBuffer &_tempW_v, bool _red_pass);
         void operator()(const Range &range) const;
     };
 
@@ -183,9 +185,8 @@ class VariationalRefinementImpl : public VariationalRefinement
         int h;
         bool red_pass;
 
-        ComputeSmoothnessTermVertPass_ParBody(VariationalRefinementImpl &_var, int _nstripes, int _h, RedBlackBuffer &W_u,
-            RedBlackBuffer &_W_v,
-            bool _red_pass);
+        ComputeSmoothnessTermVertPass_ParBody(VariationalRefinementImpl &_var, int _nstripes, int _h,
+                                              RedBlackBuffer &W_u, RedBlackBuffer &_W_v, bool _red_pass);
         void operator()(const Range &range) const;
     };
 
@@ -195,7 +196,7 @@ class VariationalRefinementImpl : public VariationalRefinement
         RedBlackBuffer *dW_u, *dW_v;
         int nstripes, stripe_sz;
         int h;
-        bool red_pass; // red of black pass
+        bool red_pass;
 
         RedBlackSOR_ParBody(VariationalRefinementImpl &_var, int _nstripes, int _h, RedBlackBuffer &_dW_u,
                             RedBlackBuffer &_dW_v, bool _red_pass);
@@ -215,22 +216,25 @@ VariationalRefinementImpl::VariationalRefinementImpl()
     epsilon = 0.001f;
 }
 
-/////////////////// RedBlackBuffer auxiliary functions ///////////////////
-
+/* This function converts an input Mat into the RedBlackBuffer format, which involves
+ * splitting the input buffer into two and adding repeated borders. Assumes that enough
+ * memory in dst is already allocated.
+ */
 void VariationalRefinementImpl::splitCheckerboard(RedBlackBuffer &dst, Mat &src)
 {
-    // splits one buffer into two using a checkerboard pattern
-    // assumes that enough memory is already allocated
-    // adds repeated-border padding
     int buf_j, j;
-    int buf_w = (int)ceil(src.cols / 2.0) + 2;
+    int buf_w = (int)ceil(src.cols / 2.0) + 2; //!< max width of red/black buffers with borders
+
+    /* Rows of red and black buffers can have different actual width, some extra repeated values are
+     * added for padding in such cases.
+     */
     for (int i = 0; i < src.rows; i++)
     {
         float *src_buf = src.ptr<float>(i);
         float *r_buf = dst.red.ptr<float>(i + 1);
         float *b_buf = dst.black.ptr<float>(i + 1);
-        buf_j = 1;
         r_buf[0] = b_buf[0] = src_buf[0];
+        buf_j = 1;
         if (i % 2 == 0)
         {
             for (j = 0; j < src.cols - 1; j += 2)
@@ -259,6 +263,8 @@ void VariationalRefinementImpl::splitCheckerboard(RedBlackBuffer &dst, Mat &src)
         }
         r_buf[buf_w - 1] = b_buf[buf_w - 1] = src_buf[j];
     }
+
+    /* Fill top and bottom borders: */
     {
         float *r_buf_border = dst.red.ptr<float>(dst.red.rows - 1);
         float *b_buf_border = dst.black.ptr<float>(dst.black.rows - 1);
@@ -277,10 +283,11 @@ void VariationalRefinementImpl::splitCheckerboard(RedBlackBuffer &dst, Mat &src)
     }
 }
 
+/* The inverse of splitCheckerboard, i.e. converting the RedBlackBuffer back into Mat.
+ * Assumes that enough memory in dst is already allocated.
+ */
 void VariationalRefinementImpl::mergeCheckerboard(Mat &dst, RedBlackBuffer &src)
 {
-    // merge two buffers into one using a checkerboard pattern
-    // assumes that enough memory is already allocated
     int buf_j, j;
     for (int i = 0; i < dst.rows; i++)
     {
@@ -314,6 +321,9 @@ void VariationalRefinementImpl::mergeCheckerboard(Mat &dst, RedBlackBuffer &src)
     }
 }
 
+/* An auxiliary function that updates the borders. Used to enforce that border values repeat
+ * the ones adjacent to the border.
+ */
 void VariationalRefinementImpl::updateRepeatedBorders(RedBlackBuffer &dst)
 {
     int buf_w = dst.red.cols;
@@ -339,7 +349,6 @@ void VariationalRefinementImpl::updateRepeatedBorders(RedBlackBuffer &dst)
                 b_buf[dst.black_odd_len + 1] = r_buf[dst.red_odd_len];
         }
     }
-
     {
         float *r_buf_border = dst.red.ptr<float>(dst.red.rows - 1);
         float *b_buf_border = dst.black.ptr<float>(dst.black.rows - 1);
@@ -360,6 +369,7 @@ void VariationalRefinementImpl::updateRepeatedBorders(RedBlackBuffer &dst)
 
 void VariationalRefinementImpl::RedBlackBuffer::create(Size s)
 {
+    /* Allocate enough memory to include borders */
     int w = (int)ceil(s.width / 2.0) + 2;
     red.create(s.height + 2, w);
     black.create(s.height + 2, w);
@@ -379,28 +389,27 @@ void VariationalRefinementImpl::RedBlackBuffer::release()
     black.release();
 }
 
-//////////////////////////////////////////////////////////////////////////
-
-VariationalRefinementImpl::ParallelOp_ParBody::ParallelOp_ParBody(VariationalRefinementImpl& _var, vector<Op> _ops, vector<void*>& _op1s, vector<void*>& _op2s, vector<void*>& _op3s):
-    var(&_var), ops(_ops), op1s(_op1s), op2s(_op2s), op3s(_op3s)
-{}
-
-void VariationalRefinementImpl::ParallelOp_ParBody::operator() (const Range& range) const
+VariationalRefinementImpl::ParallelOp_ParBody::ParallelOp_ParBody(VariationalRefinementImpl &_var, vector<Op> _ops,
+                                                                  vector<void *> &_op1s, vector<void *> &_op2s,
+                                                                  vector<void *> &_op3s)
+    : var(&_var), ops(_ops), op1s(_op1s), op2s(_op2s), op3s(_op3s)
 {
-    for (int i = range.start; i<range.end; i++)
+}
+
+void VariationalRefinementImpl::ParallelOp_ParBody::operator()(const Range &range) const
+{
+    for (int i = range.start; i < range.end; i++)
         (var->*ops[i])(op1s[i], op2s[i], op3s[i]);
 }
 
-void VariationalRefinementImpl::warpImage(Mat &dst, const Mat &src, const Mat &flow_u, const Mat &flow_v)
+void VariationalRefinementImpl::warpImage(Mat &dst, Mat &src, Mat &flow_u, Mat &flow_v)
 {
-    const float *pFlowU, *pFlowV;
-    float *pMapX, *pMapY;
     for (int i = 0; i < flow_u.rows; i++)
     {
-        pFlowU = flow_u.ptr<float>(i);
-        pFlowV = flow_v.ptr<float>(i);
-        pMapX = mapX.ptr<float>(i);
-        pMapY = mapY.ptr<float>(i);
+        float *pFlowU = flow_u.ptr<float>(i);
+        float *pFlowV = flow_v.ptr<float>(i);
+        float *pMapX = mapX.ptr<float>(i);
+        float *pMapY = mapY.ptr<float>(i);
         for (int j = 0; j < flow_u.cols; j++)
         {
             pMapX[j] = j + pFlowU[j];
@@ -410,9 +419,8 @@ void VariationalRefinementImpl::warpImage(Mat &dst, const Mat &src, const Mat &f
     remap(src, dst, mapX, mapY, INTER_LINEAR, BORDER_REPLICATE);
 }
 
-void VariationalRefinementImpl::prepareBuffers(const Mat &I0, const Mat &I1, const Mat &W_u, const Mat &W_v)
+void VariationalRefinementImpl::prepareBuffers(Mat &I0, Mat &I1, Mat &W_u, Mat &W_v)
 {
-    double startTick, time;
     Size s = I0.size();
     A11.create(s);
     A12.create(s);
@@ -449,44 +457,75 @@ void VariationalRefinementImpl::prepareBuffers(const Mat &I0, const Mat &I1, con
 
     mapX.create(s);
     mapY.create(s);
-    
+
+    /* Floating point warps work significantly better than fixed-point */
     Mat I1flt, warpedI;
-    I1.convertTo(I1flt, CV_32F); // works slightly better with floating-point warps
+    I1.convertTo(I1flt, CV_32F);
     warpImage(warpedI, I1flt, W_u, W_v);
 
-    // computing derivatives on the average of the current and warped next frame:
+    /* Computing an average of the current and warped next frames (to compute the derivatives on) and
+     * temporal derivative Iz
+     */
     Mat averagedI;
-
     {
-        vector<void*> op1s; op1s.push_back((void*)&I0); op1s.push_back((void*)&warpedI);
-        vector<void*> op2s; op2s.push_back((void*)&warpedI); op2s.push_back((void*)&I0);
-        vector<void*> op3s; op3s.push_back((void*)&averagedI); op3s.push_back((void*)&Iz);
-        vector<Op> ops; ops.push_back(&VariationalRefinementImpl::averageOp); ops.push_back(&VariationalRefinementImpl::subtractOp);
+        vector<void *> op1s;
+        op1s.push_back((void *)&I0);
+        op1s.push_back((void *)&warpedI);
+        vector<void *> op2s;
+        op2s.push_back((void *)&warpedI);
+        op2s.push_back((void *)&I0);
+        vector<void *> op3s;
+        op3s.push_back((void *)&averagedI);
+        op3s.push_back((void *)&Iz);
+        vector<Op> ops;
+        ops.push_back(&VariationalRefinementImpl::averageOp);
+        ops.push_back(&VariationalRefinementImpl::subtractOp);
         parallel_for_(Range(0, 2), ParallelOp_ParBody(*this, ops, op1s, op2s, op3s));
     }
-
     splitCheckerboard(Iz_rb, Iz);
 
+    /* Computing first-order derivatives */
     {
-        vector<void*> op1s; op1s.push_back((void*)&averagedI); op1s.push_back((void*)&averagedI);
-        op1s.push_back((void*)&Iz); op1s.push_back((void*)&Iz);
-        vector<void*> op2s; op2s.push_back((void*)&Ix); op2s.push_back((void*)&Iy);
-        op2s.push_back((void*)&Ixz); op2s.push_back((void*)&Iyz);
-        vector<void*> op3s; op3s.push_back((void*)&Ix_rb); op3s.push_back((void*)&Iy_rb);
-        op3s.push_back((void*)&Ixz_rb); op3s.push_back((void*)&Iyz_rb);
-        vector<Op> ops; ops.push_back(&VariationalRefinementImpl::gradHorizAndSplitOp); ops.push_back(&VariationalRefinementImpl::gradVertAndSplitOp);
-        ops.push_back(&VariationalRefinementImpl::gradHorizAndSplitOp); ops.push_back(&VariationalRefinementImpl::gradVertAndSplitOp);
+        vector<void *> op1s;
+        op1s.push_back((void *)&averagedI);
+        op1s.push_back((void *)&averagedI);
+        op1s.push_back((void *)&Iz);
+        op1s.push_back((void *)&Iz);
+        vector<void *> op2s;
+        op2s.push_back((void *)&Ix);
+        op2s.push_back((void *)&Iy);
+        op2s.push_back((void *)&Ixz);
+        op2s.push_back((void *)&Iyz);
+        vector<void *> op3s;
+        op3s.push_back((void *)&Ix_rb);
+        op3s.push_back((void *)&Iy_rb);
+        op3s.push_back((void *)&Ixz_rb);
+        op3s.push_back((void *)&Iyz_rb);
+        vector<Op> ops;
+        ops.push_back(&VariationalRefinementImpl::gradHorizAndSplitOp);
+        ops.push_back(&VariationalRefinementImpl::gradVertAndSplitOp);
+        ops.push_back(&VariationalRefinementImpl::gradHorizAndSplitOp);
+        ops.push_back(&VariationalRefinementImpl::gradVertAndSplitOp);
         parallel_for_(Range(0, 4), ParallelOp_ParBody(*this, ops, op1s, op2s, op3s));
     }
 
+    /* Computing second-order derivatives */
     {
-        vector<void*> op1s; op1s.push_back((void*)&Ix); op1s.push_back((void*)&Ix);
-        op1s.push_back((void*)&Iy);
-        vector<void*> op2s; op2s.push_back((void*)&Ixx); op2s.push_back((void*)&Ixy);
-        op2s.push_back((void*)&Iyy);
-        vector<void*> op3s; op3s.push_back((void*)&Ixx_rb); op3s.push_back((void*)&Ixy_rb);
-        op3s.push_back((void*)&Iyy_rb);
-        vector<Op> ops; ops.push_back(&VariationalRefinementImpl::gradHorizAndSplitOp); ops.push_back(&VariationalRefinementImpl::gradVertAndSplitOp);
+        vector<void *> op1s;
+        op1s.push_back((void *)&Ix);
+        op1s.push_back((void *)&Ix);
+        op1s.push_back((void *)&Iy);
+        vector<void *> op2s;
+        op2s.push_back((void *)&Ixx);
+        op2s.push_back((void *)&Ixy);
+        op2s.push_back((void *)&Iyy);
+        vector<void *> op3s;
+        op3s.push_back((void *)&Ixx_rb);
+        op3s.push_back((void *)&Ixy_rb);
+        op3s.push_back((void *)&Iyy_rb);
+        vector<Op> ops;
+        ops.push_back(&VariationalRefinementImpl::gradHorizAndSplitOp);
+        ops.push_back(&VariationalRefinementImpl::gradVertAndSplitOp);
         ops.push_back(&VariationalRefinementImpl::gradVertAndSplitOp);
         parallel_for_(Range(0, 3), ParallelOp_ParBody(*this, ops, op1s, op2s, op3s));
     }
@@ -501,24 +540,22 @@ VariationalRefinementImpl::ComputeDataTerm_ParBody::ComputeDataTerm_ParBody(Vari
     stripe_sz = (int)ceil(h / (double)nstripes);
 }
 
+/* This function computes parts of the main linear system coefficients A11,A12,A22,b1,b1
+ * that correspond to the data term, which includes color and gradient constancy assumptions.
+ */
 void VariationalRefinementImpl::ComputeDataTerm_ParBody::operator()(const Range &range) const
 {
-    /*Using robust data term based on color and gradient constancy assumptions*/
-
-    /*In this function we compute linear system coefficients
-    A11,A12,A22,b1,b1 based on the data term */
-
     int start_i = min(range.start * stripe_sz, h);
     int end_i = min(range.end * stripe_sz, h);
 
-    const float zeta_squared = var->zeta * var->zeta;
-    const float epsilon_squared = var->epsilon * var->epsilon;
-    const float gamma2 = var->gamma / 2;
-    const float delta2 = var->delta / 2;
+    float zeta_squared = var->zeta * var->zeta;
+    float epsilon_squared = var->epsilon * var->epsilon;
+    float gamma2 = var->gamma / 2;
+    float delta2 = var->delta / 2;
 
-    const float *pIx, *pIy, *pIz;
-    const float *pIxx, *pIxy, *pIyy, *pIxz, *pIyz;
-    const float *pdU, *pdV;
+    float *pIx, *pIy, *pIz;
+    float *pIxx, *pIxy, *pIyy, *pIxz, *pIyz;
+    float *pdU, *pdV;
     float *pa11, *pa12, *pa22, *pb1, *pb2;
 
     float derivNorm, derivNorm2;
@@ -527,50 +564,37 @@ void VariationalRefinementImpl::ComputeDataTerm_ParBody::operator()(const Range 
     int len;
     for (int i = start_i; i < end_i; i++)
     {
+#define INIT_ROW_POINTERS(color)                                                                                       \
+    pIx = var->Ix_rb.color.ptr<float>(i + 1) + 1;                                                                      \
+    pIy = var->Iy_rb.color.ptr<float>(i + 1) + 1;                                                                      \
+    pIz = var->Iz_rb.color.ptr<float>(i + 1) + 1;                                                                      \
+    pIxx = var->Ixx_rb.color.ptr<float>(i + 1) + 1;                                                                    \
+    pIxy = var->Ixy_rb.color.ptr<float>(i + 1) + 1;                                                                    \
+    pIyy = var->Iyy_rb.color.ptr<float>(i + 1) + 1;                                                                    \
+    pIxz = var->Ixz_rb.color.ptr<float>(i + 1) + 1;                                                                    \
+    pIyz = var->Iyz_rb.color.ptr<float>(i + 1) + 1;                                                                    \
+    pa11 = var->A11.color.ptr<float>(i + 1) + 1;                                                                       \
+    pa12 = var->A12.color.ptr<float>(i + 1) + 1;                                                                       \
+    pa22 = var->A22.color.ptr<float>(i + 1) + 1;                                                                       \
+    pb1 = var->b1.color.ptr<float>(i + 1) + 1;                                                                         \
+    pb2 = var->b2.color.ptr<float>(i + 1) + 1;                                                                         \
+    pdU = dW_u->color.ptr<float>(i + 1) + 1;                                                                           \
+    pdV = dW_v->color.ptr<float>(i + 1) + 1;                                                                           \
+    if (i % 2 == 0)                                                                                                    \
+        len = var->Ix_rb.##color##_even_len;                                                                           \
+    else                                                                                                               \
+        len = var->Ix_rb.##color##_odd_len;
+
         if (red_pass)
         {
-            pIx = var->Ix_rb.red.ptr<float>(i + 1) + 1;
-            pIy = var->Iy_rb.red.ptr<float>(i + 1) + 1;
-            pIz = var->Iz_rb.red.ptr<float>(i + 1) + 1;
-            pIxx = var->Ixx_rb.red.ptr<float>(i + 1) + 1;
-            pIxy = var->Ixy_rb.red.ptr<float>(i + 1) + 1;
-            pIyy = var->Iyy_rb.red.ptr<float>(i + 1) + 1;
-            pIxz = var->Ixz_rb.red.ptr<float>(i + 1) + 1;
-            pIyz = var->Iyz_rb.red.ptr<float>(i + 1) + 1;
-            pa11 = var->A11.red.ptr<float>(i + 1) + 1;
-            pa12 = var->A12.red.ptr<float>(i + 1) + 1;
-            pa22 = var->A22.red.ptr<float>(i + 1) + 1;
-            pb1 = var->b1.red.ptr<float>(i + 1) + 1;
-            pb2 = var->b2.red.ptr<float>(i + 1) + 1;
-            pdU = dW_u->red.ptr<float>(i + 1) + 1;
-            pdV = dW_v->red.ptr<float>(i + 1) + 1;
-            if (i % 2 == 0)
-                len = var->Ix_rb.red_even_len;
-            else
-                len = var->Ix_rb.red_odd_len;
+            INIT_ROW_POINTERS(red);
         }
         else
         {
-            pIx = var->Ix_rb.black.ptr<float>(i + 1) + 1;
-            pIy = var->Iy_rb.black.ptr<float>(i + 1) + 1;
-            pIz = var->Iz_rb.black.ptr<float>(i + 1) + 1;
-            pIxx = var->Ixx_rb.black.ptr<float>(i + 1) + 1;
-            pIxy = var->Ixy_rb.black.ptr<float>(i + 1) + 1;
-            pIyy = var->Iyy_rb.black.ptr<float>(i + 1) + 1;
-            pIxz = var->Ixz_rb.black.ptr<float>(i + 1) + 1;
-            pIyz = var->Iyz_rb.black.ptr<float>(i + 1) + 1;
-            pa11 = var->A11.black.ptr<float>(i + 1) + 1;
-            pa12 = var->A12.black.ptr<float>(i + 1) + 1;
-            pa22 = var->A22.black.ptr<float>(i + 1) + 1;
-            pb1 = var->b1.black.ptr<float>(i + 1) + 1;
-            pb2 = var->b2.black.ptr<float>(i + 1) + 1;
-            pdU = dW_u->black.ptr<float>(i + 1) + 1;
-            pdV = dW_v->black.ptr<float>(i + 1) + 1;
-            if (i % 2 == 0)
-                len = var->Ix_rb.black_even_len;
-            else
-                len = var->Ix_rb.black_odd_len;
+            INIT_ROW_POINTERS(black);
         }
+#undef INIT_ROW_POINTERS
+
         int j = 0;
 #ifdef CV_SIMD128
         v_float32x4 zeta_vec = v_setall_f32(zeta_squared);
@@ -584,7 +608,7 @@ void VariationalRefinementImpl::ComputeDataTerm_ParBody::operator()(const Range 
         v_float32x4 Ik1z_vec, Ik1zx_vec, Ik1zy_vec;
         v_float32x4 pa11_vec, pa12_vec, pa22_vec, pb1_vec, pb2_vec;
 
-        for (; j < len - 3; j+=4)
+        for (; j < len - 3; j += 4)
         {
             pIx_vec = v_load(pIx + j);
             pIy_vec = v_load(pIy + j);
@@ -592,15 +616,15 @@ void VariationalRefinementImpl::ComputeDataTerm_ParBody::operator()(const Range 
             pdU_vec = v_load(pdU + j);
             pdV_vec = v_load(pdV + j);
 
-            derivNorm_vec = pIx_vec*pIx_vec + pIy_vec*pIy_vec + zeta_vec;
-            Ik1z_vec = pIz_vec + pIx_vec*pdU_vec + pIy_vec*pdV_vec;
-            weight_vec = delta_vec / v_sqrt(Ik1z_vec*Ik1z_vec / derivNorm_vec + eps_vec);
+            derivNorm_vec = pIx_vec * pIx_vec + pIy_vec * pIy_vec + zeta_vec;
+            Ik1z_vec = pIz_vec + pIx_vec * pdU_vec + pIy_vec * pdV_vec;
+            weight_vec = (delta_vec / v_sqrt(Ik1z_vec * Ik1z_vec / derivNorm_vec + eps_vec)) / derivNorm_vec;
 
-            pa11_vec = weight_vec * (pIx_vec*pIx_vec / derivNorm_vec) + zeta_vec;
-            pa12_vec = weight_vec * (pIx_vec*pIy_vec / derivNorm_vec);
-            pa22_vec = weight_vec * (pIy_vec*pIy_vec / derivNorm_vec) + zeta_vec;
-            pb1_vec = zero_vec-weight_vec * (pIz_vec*pIx_vec / derivNorm_vec);
-            pb2_vec = zero_vec -weight_vec * (pIz_vec*pIy_vec / derivNorm_vec);
+            pa11_vec = weight_vec * (pIx_vec * pIx_vec) + zeta_vec;
+            pa12_vec = weight_vec * (pIx_vec * pIy_vec);
+            pa22_vec = weight_vec * (pIy_vec * pIy_vec) + zeta_vec;
+            pb1_vec = zero_vec - weight_vec * (pIz_vec * pIx_vec);
+            pb2_vec = zero_vec - weight_vec * (pIz_vec * pIy_vec);
 
             pIxx_vec = v_load(pIxx + j);
             pIxy_vec = v_load(pIxy + j);
@@ -612,7 +636,8 @@ void VariationalRefinementImpl::ComputeDataTerm_ParBody::operator()(const Range 
             derivNorm2_vec = pIyy_vec * pIyy_vec + pIxy_vec * pIxy_vec + zeta_vec;
             Ik1zx_vec = pIxz_vec + pIxx_vec * pdU_vec + pIxy_vec * pdV_vec;
             Ik1zy_vec = pIyz_vec + pIxy_vec * pdU_vec + pIyy_vec * pdV_vec;
-            weight_vec = gamma_vec / v_sqrt(Ik1zx_vec * Ik1zx_vec / derivNorm_vec + Ik1zy_vec * Ik1zy_vec / derivNorm2_vec + eps_vec);
+            weight_vec = gamma_vec / v_sqrt(Ik1zx_vec * Ik1zx_vec / derivNorm_vec +
+                                            Ik1zy_vec * Ik1zy_vec / derivNorm2_vec + eps_vec);
 
             pa11_vec += weight_vec * (pIxx_vec * pIxx_vec / derivNorm_vec + pIxy_vec * pIxy_vec / derivNorm2_vec);
             pa12_vec += weight_vec * (pIxx_vec * pIxy_vec / derivNorm_vec + pIxy_vec * pIyy_vec / derivNorm2_vec);
@@ -629,32 +654,31 @@ void VariationalRefinementImpl::ComputeDataTerm_ParBody::operator()(const Range 
 #endif
         for (; j < len; j++)
         {
-            // Step 1: color contancy
-            // Normalization factor:
+            /* Step 1: Compute color contancy terms */
+            /* Normalization factor:*/
             derivNorm = pIx[j] * pIx[j] + pIy[j] * pIy[j] + zeta_squared;
-            // Color constancy penalty (computed by Taylor expansion):
+            /* Color constancy penalty (computed by Taylor expansion):*/
             Ik1z = pIz[j] + pIx[j] * pdU[j] + pIy[j] * pdV[j];
-            // Weight of the color constancy term in the current fixed-point iteration:
-            weight = delta2 / sqrt(Ik1z * Ik1z / derivNorm + epsilon_squared);
-            // Add respective color constancy components to the linear sustem coefficients:
-            pa11[j] = weight * (pIx[j] * pIx[j] / derivNorm) + zeta_squared;
-            pa12[j] = weight * (pIx[j] * pIy[j] / derivNorm);
-            pa22[j] = weight * (pIy[j] * pIy[j] / derivNorm) + zeta_squared;
-            pb1[j] = -weight * (pIz[j] * pIx[j] / derivNorm);
-            pb2[j] = -weight * (pIz[j] * pIy[j] / derivNorm);
+            /* Weight of the color constancy term in the current fixed-point iteration divided by derivNorm: */
+            weight = (delta2 / sqrt(Ik1z * Ik1z / derivNorm + epsilon_squared)) / derivNorm;
+            /* Add respective color constancy terms to the linear sustem coefficients: */
+            pa11[j] = weight * (pIx[j] * pIx[j]) + zeta_squared;
+            pa12[j] = weight * (pIx[j] * pIy[j]);
+            pa22[j] = weight * (pIy[j] * pIy[j]) + zeta_squared;
+            pb1[j] = -weight * (pIz[j] * pIx[j]);
+            pb2[j] = -weight * (pIz[j] * pIy[j]);
 
-            // Step 2: gradient contancy
-            // Normalization factor for x gradient:
+            /* Step 2: Compute gradient contancy terms */
+            /* Normalization factor for x gradient: */
             derivNorm = pIxx[j] * pIxx[j] + pIxy[j] * pIxy[j] + zeta_squared;
-            // Normalization factor for y gradient:
+            /* Normalization factor for y gradient: */
             derivNorm2 = pIyy[j] * pIyy[j] + pIxy[j] * pIxy[j] + zeta_squared;
-            // Gradient constancy penalties (computed by Taylor expansion):
+            /* Gradient constancy penalties (computed by Taylor expansion): */
             Ik1zx = pIxz[j] + pIxx[j] * pdU[j] + pIxy[j] * pdV[j];
             Ik1zy = pIyz[j] + pIxy[j] * pdU[j] + pIyy[j] * pdV[j];
-
-            // Weight of the gradient constancy term in the current fixed-point iteration:
+            /* Weight of the gradient constancy term in the current fixed-point iteration: */
             weight = gamma2 / sqrt(Ik1zx * Ik1zx / derivNorm + Ik1zy * Ik1zy / derivNorm2 + epsilon_squared);
-            // Add respective gradient constancy components to the linear system coefficients:
+            /* Add respective gradient constancy components to the linear system coefficients: */
             pa11[j] += weight * (pIxx[j] * pIxx[j] / derivNorm + pIxy[j] * pIxy[j] / derivNorm2);
             pa12[j] += weight * (pIxx[j] * pIxy[j] / derivNorm + pIxy[j] * pIyy[j] / derivNorm2);
             pa22[j] += weight * (pIxy[j] * pIxy[j] / derivNorm + pIyy[j] * pIyy[j] / derivNorm2);
@@ -673,143 +697,100 @@ VariationalRefinementImpl::ComputeSmoothnessTermHorPass_ParBody::ComputeSmoothne
     stripe_sz = (int)ceil(h / (double)nstripes);
 }
 
+/* This function updates the linear system coefficients A11,A22,b1,b1 according to the
+ * flow smoothness term and computes correponding weights for the current fixed point iteration.
+ * A11,A22,b1,b1 are updated only partially (horizontal pass). Doing both horizontal and vertical
+ * passes in one loop complicates parallelization (different threads write to the same elements).
+ */
 void VariationalRefinementImpl::ComputeSmoothnessTermHorPass_ParBody::operator()(const Range &range) const
 {
-    /*Using robust penalty on flow gradient*/
-
-    /*In this function we update b1, b2, A11, A22 coefficients of the linear system
-    and compute smoothness term weights for the current fixed-point iteration */
-
     int start_i = min(range.start * stripe_sz, h);
     int end_i = min(range.end * stripe_sz, h);
 
-    const float epsilon_squared = var->epsilon * var->epsilon;
-    const float alpha2 = var->alpha / 2;
+    float epsilon_squared = var->epsilon * var->epsilon;
+    float alpha2 = var->alpha / 2;
     float *pWeight;
-    float *pA_u, *pA_u_next;
-    float *pA_v, *pA_v_next;
-    float *pB_u, *pB_u_next;
-    float *pB_v, *pB_v_next;
-    const float *cW_u, *cW_u_next, *cW_u_next_row;
-    const float *cW_v, *cW_v_next, *cW_v_next_row;
-    const float *pW_u, *pW_u_next;
-    const float *pW_v, *pW_v_next;
+    float *pA_u, *pA_u_next, *pA_v, *pA_v_next;
+    float *pB_u, *pB_u_next, *pB_v, *pB_v_next;
+    float *cW_u, *cW_u_next, *cW_u_next_row;
+    float *cW_v, *cW_v_next, *cW_v_next_row;
+    float *pW_u, *pW_u_next;
+    float *pW_v, *pW_v_next;
     float ux, uy, vx, vy;
     int len;
     bool touches_right_border = true;
+
+#define INIT_ROW_POINTERS(cur_color, next_color, next_offs_even, next_offs_odd, bool_default)                          \
+    pWeight = var->weights.cur_color.ptr<float>(i + 1) + 1;                                                            \
+    pA_u = var->A11.cur_color.ptr<float>(i + 1) + 1;                                                                   \
+    pB_u = var->b1.cur_color.ptr<float>(i + 1) + 1;                                                                    \
+    cW_u = curW_u->cur_color.ptr<float>(i + 1) + 1;                                                                    \
+    pW_u = W_u->cur_color.ptr<float>(i + 1) + 1;                                                                       \
+    pA_v = var->A22.cur_color.ptr<float>(i + 1) + 1;                                                                   \
+    pB_v = var->b2.cur_color.ptr<float>(i + 1) + 1;                                                                    \
+    cW_v = curW_v->cur_color.ptr<float>(i + 1) + 1;                                                                    \
+    pW_v = W_v->cur_color.ptr<float>(i + 1) + 1;                                                                       \
+                                                                                                                       \
+    cW_u_next_row = curW_u->next_color.ptr<float>(i + 2) + 1;                                                          \
+    cW_v_next_row = curW_v->next_color.ptr<float>(i + 2) + 1;                                                          \
+                                                                                                                       \
+    if (i % 2 == 0)                                                                                                    \
+    {                                                                                                                  \
+        pA_u_next = var->A11.next_color.ptr<float>(i + 1) + next_offs_even;                                            \
+        pB_u_next = var->b1.next_color.ptr<float>(i + 1) + next_offs_even;                                             \
+        cW_u_next = curW_u->next_color.ptr<float>(i + 1) + next_offs_even;                                             \
+        pW_u_next = W_u->next_color.ptr<float>(i + 1) + next_offs_even;                                                \
+        pA_v_next = var->A22.next_color.ptr<float>(i + 1) + next_offs_even;                                            \
+        pB_v_next = var->b2.next_color.ptr<float>(i + 1) + next_offs_even;                                             \
+        cW_v_next = curW_v->next_color.ptr<float>(i + 1) + next_offs_even;                                             \
+        pW_v_next = W_v->next_color.ptr<float>(i + 1) + next_offs_even;                                                \
+        len = var->A11.##cur_color##_even_len;                                                                         \
+        if (var->A11.##cur_color##_even_len != var->A11.##cur_color##_odd_len)                                         \
+            touches_right_border = bool_default;                                                                       \
+        else                                                                                                           \
+            touches_right_border = !bool_default;                                                                      \
+    }                                                                                                                  \
+    else                                                                                                               \
+    {                                                                                                                  \
+        pA_u_next = var->A11.next_color.ptr<float>(i + 1) + next_offs_odd;                                             \
+        pB_u_next = var->b1.next_color.ptr<float>(i + 1) + next_offs_odd;                                              \
+        cW_u_next = curW_u->next_color.ptr<float>(i + 1) + next_offs_odd;                                              \
+        pW_u_next = W_u->next_color.ptr<float>(i + 1) + next_offs_odd;                                                 \
+        pA_v_next = var->A22.next_color.ptr<float>(i + 1) + next_offs_odd;                                             \
+        pB_v_next = var->b2.next_color.ptr<float>(i + 1) + next_offs_odd;                                              \
+        cW_v_next = curW_v->next_color.ptr<float>(i + 1) + next_offs_odd;                                              \
+        pW_v_next = W_v->next_color.ptr<float>(i + 1) + next_offs_odd;                                                 \
+        len = var->A11.##cur_color##_odd_len;                                                                          \
+        if (var->A11.##cur_color##_even_len != var->A11.##cur_color##_odd_len)                                         \
+            touches_right_border = !bool_default;                                                                      \
+        else                                                                                                           \
+            touches_right_border = bool_default;                                                                       \
+    }
 
     for (int i = start_i; i < end_i; i++)
     {
         if (red_pass)
         {
-            pWeight = var->weights.red.ptr<float>(i + 1) + 1;
-            pA_u = var->A11.red.ptr<float>(i + 1) + 1;
-            pB_u = var->b1.red.ptr<float>(i + 1) + 1;
-            cW_u = curW_u->red.ptr<float>(i + 1) + 1;
-            pW_u = W_u->red.ptr<float>(i + 1) + 1;
-            pA_v = var->A22.red.ptr<float>(i + 1) + 1;
-            pB_v = var->b2.red.ptr<float>(i + 1) + 1;
-            cW_v = curW_v->red.ptr<float>(i + 1) + 1;
-            pW_v = W_v->red.ptr<float>(i + 1) + 1;
-
-            cW_u_next_row = curW_u->black.ptr<float>(i + 2) + 1;
-            cW_v_next_row = curW_v->black.ptr<float>(i + 2) + 1;
-
-            if (i % 2 == 0)
-            {
-                pA_u_next = var->A11.black.ptr<float>(i + 1) + 1;
-                pB_u_next = var->b1.black.ptr<float>(i + 1) + 1;
-                cW_u_next = curW_u->black.ptr<float>(i + 1) + 1;
-                pW_u_next = W_u->black.ptr<float>(i + 1) + 1;
-                pA_v_next = var->A22.black.ptr<float>(i + 1) + 1;
-                pB_v_next = var->b2.black.ptr<float>(i + 1) + 1;
-                cW_v_next = curW_v->black.ptr<float>(i + 1) + 1;
-                pW_v_next = W_v->black.ptr<float>(i + 1) + 1;
-                len = var->A11.red_even_len;
-                if (var->A11.red_even_len > var->A11.red_odd_len)
-                    touches_right_border = true;
-                else
-                    touches_right_border = false;
-            }
-            else
-            {
-                pA_u_next = var->A11.black.ptr<float>(i + 1) + 2;
-                pB_u_next = var->b1.black.ptr<float>(i + 1) + 2;
-                cW_u_next = curW_u->black.ptr<float>(i + 1) + 2;
-                pW_u_next = W_u->black.ptr<float>(i + 1) + 2;
-                pA_v_next = var->A22.black.ptr<float>(i + 1) + 2;
-                pB_v_next = var->b2.black.ptr<float>(i + 1) + 2;
-                cW_v_next = curW_v->black.ptr<float>(i + 1) + 2;
-                pW_v_next = W_v->black.ptr<float>(i + 1) + 2;
-                len = var->A11.red_odd_len;
-                if (var->A11.red_even_len > var->A11.red_odd_len)
-                    touches_right_border = false;
-                else
-                    touches_right_border = true;
-            }
+            INIT_ROW_POINTERS(red, black, 1, 2, true);
         }
         else
         {
-            pWeight = var->weights.black.ptr<float>(i + 1) + 1;
-            pA_u = var->A11.black.ptr<float>(i + 1) + 1;
-            pB_u = var->b1.black.ptr<float>(i + 1) + 1;
-            cW_u = curW_u->black.ptr<float>(i + 1) + 1;
-            pW_u = W_u->black.ptr<float>(i + 1) + 1;
-            pA_v = var->A22.black.ptr<float>(i + 1) + 1;
-            pB_v = var->b2.black.ptr<float>(i + 1) + 1;
-            cW_v = curW_v->black.ptr<float>(i + 1) + 1;
-            pW_v = W_v->black.ptr<float>(i + 1) + 1;
-
-            cW_u_next_row = curW_u->red.ptr<float>(i + 2) + 1;
-            cW_v_next_row = curW_v->red.ptr<float>(i + 2) + 1;
-
-            if (i % 2 == 0)
-            {
-                pA_u_next = var->A11.red.ptr<float>(i + 1) + 2;
-                pB_u_next = var->b1.red.ptr<float>(i + 1) + 2;
-                cW_u_next = curW_u->red.ptr<float>(i + 1) + 2;
-                pW_u_next = W_u->red.ptr<float>(i + 1) + 2;
-                pA_v_next = var->A22.red.ptr<float>(i + 1) + 2;
-                pB_v_next = var->b2.red.ptr<float>(i + 1) + 2;
-                cW_v_next = curW_v->red.ptr<float>(i + 1) + 2;
-                pW_v_next = W_v->red.ptr<float>(i + 1) + 2;
-                len = var->A11.black_even_len;
-                if (var->A11.black_even_len < var->A11.black_odd_len)
-                    touches_right_border = false;
-                else
-                    touches_right_border = true;
-            }
-            else
-            {
-                pA_u_next = var->A11.red.ptr<float>(i + 1) + 1;
-                pB_u_next = var->b1.red.ptr<float>(i + 1) + 1;
-                cW_u_next = curW_u->red.ptr<float>(i + 1) + 1;
-                pW_u_next = W_u->red.ptr<float>(i + 1) + 1;
-                pA_v_next = var->A22.red.ptr<float>(i + 1) + 1;
-                pB_v_next = var->b2.red.ptr<float>(i + 1) + 1;
-                cW_v_next = curW_v->red.ptr<float>(i + 1) + 1;
-                pW_v_next = W_v->red.ptr<float>(i + 1) + 1;
-                len = var->A11.black_odd_len;
-                if (var->A11.black_even_len < var->A11.black_odd_len)
-                    touches_right_border = true;
-                else
-                    touches_right_border = false;
-            }
+            INIT_ROW_POINTERS(black, red, 2, 1, false);
         }
 
 #define COMPUTE                                                                                                        \
-    /*gradients for the flow on the current fixed-point iteration:*/                                                   \
+    /* Gradients for the flow on the current fixed-point iteration: */                                                 \
     ux = cW_u_next[j] - cW_u[j];                                                                                       \
     vx = cW_v_next[j] - cW_v[j];                                                                                       \
     uy = cW_u_next_row[j] - cW_u[j];                                                                                   \
     vy = cW_v_next_row[j] - cW_v[j];                                                                                   \
-    /* weight of the smoothness term in the current fixed-point iteration:*/                                           \
+    /* Weight of the smoothness term in the current fixed-point iteration: */                                          \
     pWeight[j] = alpha2 / sqrt(ux * ux + vx * vx + uy * uy + vy * vy + epsilon_squared);                               \
-    /* gradients for initial raw flow multiplied by weight:*/                                                          \
+    /* Gradients for initial raw flow multiplied by weight:*/                                                          \
     ux = pWeight[j] * (pW_u_next[j] - pW_u[j]);                                                                        \
     vx = pWeight[j] * (pW_v_next[j] - pW_v[j]);
 
-#define UPDATE_HOR                                                                                                     \
+#define UPDATE                                                                                                         \
     pB_u[j] += ux;                                                                                                     \
     pA_u[j] += pWeight[j];                                                                                             \
     pB_v[j] += vx;                                                                                                     \
@@ -856,8 +837,10 @@ void VariationalRefinementImpl::ComputeSmoothnessTermHorPass_ParBody::operator()
         for (; j < len - 1; j++)
         {
             COMPUTE;
-            UPDATE_HOR;
+            UPDATE;
         }
+
+        /* Omit the update on the rightmost elements */
         if (touches_right_border)
         {
             COMPUTE;
@@ -865,81 +848,66 @@ void VariationalRefinementImpl::ComputeSmoothnessTermHorPass_ParBody::operator()
         else
         {
             COMPUTE;
-            UPDATE_HOR;
+            UPDATE;
         }
     }
+#undef COMPUTE
+#undef UPDATE
+#undef INIT_ROW_POINTERS
 }
 
 VariationalRefinementImpl::ComputeSmoothnessTermVertPass_ParBody::ComputeSmoothnessTermVertPass_ParBody(
-    VariationalRefinementImpl &_var, int _nstripes, int _h, RedBlackBuffer &_W_u, RedBlackBuffer &_W_v, bool _red_pass)
-    : var(&_var), nstripes(_nstripes), h(_h-1), W_u(&_W_u), W_v(&_W_v),
-    red_pass(_red_pass)
+  VariationalRefinementImpl &_var, int _nstripes, int _h, RedBlackBuffer &_W_u, RedBlackBuffer &_W_v, bool _red_pass)
+    : var(&_var), nstripes(_nstripes), W_u(&_W_u), W_v(&_W_v), red_pass(_red_pass)
 {
+    /* Omit the last row in the vertical pass */
+    h = _h - 1;
     stripe_sz = (int)ceil(h / (double)nstripes);
 }
 
+/* This function adds the last remaining terms to the linear system coefficients A11,A22,b1,b1. */
 void VariationalRefinementImpl::ComputeSmoothnessTermVertPass_ParBody::operator()(const Range &range) const
 {
     int start_i = min(range.start * stripe_sz, h);
     int end_i = min(range.end * stripe_sz, h);
 
-    const float epsilon_squared = var->epsilon * var->epsilon;
-    const float alpha2 = var->alpha / 2;
     float *pWeight;
-    float *pA_u, *pA_u_next_row;
-    float *pA_v, *pA_v_next_row;
-    float *pB_u, *pB_u_next_row;
-    float *pB_v, *pB_v_next_row;
-    const float *pW_u, *pW_u_next_row;
-    const float *pW_v, *pW_v_next_row;
+    float *pA_u, *pA_u_next_row, *pA_v, *pA_v_next_row;
+    float *pB_u, *pB_u_next_row, *pB_v, *pB_v_next_row;
+    float *pW_u, *pW_u_next_row, *pW_v, *pW_v_next_row;
     float vy, uy;
     int len;
 
     for (int i = start_i; i < end_i; i++)
     {
+#define INIT_ROW_POINTERS(cur_color, next_color)                                                                       \
+    pWeight = var->weights.cur_color.ptr<float>(i + 1) + 1;                                                            \
+    pA_u = var->A11.cur_color.ptr<float>(i + 1) + 1;                                                                   \
+    pB_u = var->b1.cur_color.ptr<float>(i + 1) + 1;                                                                    \
+    pW_u = W_u->cur_color.ptr<float>(i + 1) + 1;                                                                       \
+    pA_v = var->A22.cur_color.ptr<float>(i + 1) + 1;                                                                   \
+    pB_v = var->b2.cur_color.ptr<float>(i + 1) + 1;                                                                    \
+    pW_v = W_v->cur_color.ptr<float>(i + 1) + 1;                                                                       \
+                                                                                                                       \
+    pA_u_next_row = var->A11.next_color.ptr<float>(i + 2) + 1;                                                         \
+    pB_u_next_row = var->b1.next_color.ptr<float>(i + 2) + 1;                                                          \
+    pW_u_next_row = W_u->next_color.ptr<float>(i + 2) + 1;                                                             \
+    pA_v_next_row = var->A22.next_color.ptr<float>(i + 2) + 1;                                                         \
+    pB_v_next_row = var->b2.next_color.ptr<float>(i + 2) + 1;                                                          \
+    pW_v_next_row = W_v->next_color.ptr<float>(i + 2) + 1;                                                             \
+                                                                                                                       \
+    if (i % 2 == 0)                                                                                                    \
+        len = var->A11.##cur_color##_even_len;                                                                         \
+    else                                                                                                               \
+        len = var->A11.##cur_color##_odd_len;
+
         if (red_pass)
         {
-            pWeight = var->weights.red.ptr<float>(i + 1) + 1;
-            pA_u = var->A11.red.ptr<float>(i + 1) + 1;
-            pB_u = var->b1.red.ptr<float>(i + 1) + 1;
-            pW_u = W_u->red.ptr<float>(i + 1) + 1;
-            pA_v = var->A22.red.ptr<float>(i + 1) + 1;
-            pB_v = var->b2.red.ptr<float>(i + 1) + 1;
-            pW_v = W_v->red.ptr<float>(i + 1) + 1;
-
-            pA_u_next_row = var->A11.black.ptr<float>(i + 2) + 1;
-            pB_u_next_row = var->b1.black.ptr<float>(i + 2) + 1;
-            pW_u_next_row = W_u->black.ptr<float>(i + 2) + 1;
-            pA_v_next_row = var->A22.black.ptr<float>(i + 2) + 1;
-            pB_v_next_row = var->b2.black.ptr<float>(i + 2) + 1;
-            pW_v_next_row = W_v->black.ptr<float>(i + 2) + 1;
-
-            if (i % 2 == 0)
-                len = var->A11.red_even_len;
-            else
-                len = var->A11.red_odd_len;
+            INIT_ROW_POINTERS(red, black);
         }
         else
         {
-            pWeight = var->weights.black.ptr<float>(i + 1) + 1;
-            pA_u = var->A11.black.ptr<float>(i + 1) + 1;
-            pB_u = var->b1.black.ptr<float>(i + 1) + 1;
-            pW_u = W_u->black.ptr<float>(i + 1) + 1;
-            pA_v = var->A22.black.ptr<float>(i + 1) + 1;
-            pB_v = var->b2.black.ptr<float>(i + 1) + 1;
-            pW_v = W_v->black.ptr<float>(i + 1) + 1;
-
-            pA_u_next_row = var->A11.red.ptr<float>(i + 2) + 1;
-            pB_u_next_row = var->b1.red.ptr<float>(i + 2) + 1;
-            pW_u_next_row = W_u->red.ptr<float>(i + 2) + 1;
-            pA_v_next_row = var->A22.red.ptr<float>(i + 2) + 1;
-            pB_v_next_row = var->b2.red.ptr<float>(i + 2) + 1;
-            pW_v_next_row = W_v->red.ptr<float>(i + 2) + 1;
-
-            if (i % 2 == 0)
-                len = var->A11.black_even_len;
-            else
-                len = var->A11.black_odd_len;
+            INIT_ROW_POINTERS(black, red);
         }
         int j = 0;
 #ifdef CV_SIMD128
@@ -974,6 +942,7 @@ void VariationalRefinementImpl::ComputeSmoothnessTermVertPass_ParBody::operator(
             pB_v_next_row[j] -= vy;
             pA_v_next_row[j] += pWeight[j];
         }
+#undef INIT_ROW_POINTERS
     }
 }
 
@@ -985,6 +954,9 @@ VariationalRefinementImpl::RedBlackSOR_ParBody::RedBlackSOR_ParBody(VariationalR
     stripe_sz = (int)ceil(h / (double)nstripes);
 }
 
+/* This function implements the Red-Black SOR (successive-over relaxation) method for solving the main
+ * linear system in the current fixed-point iteration.
+ */
 void VariationalRefinementImpl::RedBlackSOR_ParBody::operator()(const Range &range) const
 {
     int start = min(range.start * stripe_sz, h);
@@ -996,82 +968,54 @@ void VariationalRefinementImpl::RedBlackSOR_ParBody::operator()(const Range &ran
     float *pdu_next_row, *pdv_next_row;
 
     float sigmaU, sigmaV;
-    float omega = var->omega;
-    int j,len;
+    int j, len;
     for (int i = start; i < end; i++)
     {
+#define INIT_ROW_POINTERS(cur_color, next_color, next_offs_even, next_offs_odd)                                        \
+    pW = var->weights.cur_color.ptr<float>(i + 1) + 1;                                                                 \
+    pa11 = var->A11.cur_color.ptr<float>(i + 1) + 1;                                                                   \
+    pa12 = var->A12.cur_color.ptr<float>(i + 1) + 1;                                                                   \
+    pa22 = var->A22.cur_color.ptr<float>(i + 1) + 1;                                                                   \
+    pb1 = var->b1.cur_color.ptr<float>(i + 1) + 1;                                                                     \
+    pb2 = var->b2.cur_color.ptr<float>(i + 1) + 1;                                                                     \
+    pdu = dW_u->cur_color.ptr<float>(i + 1) + 1;                                                                       \
+    pdv = dW_v->cur_color.ptr<float>(i + 1) + 1;                                                                       \
+                                                                                                                       \
+    pdu_next_row = dW_u->next_color.ptr<float>(i + 2) + 1;                                                             \
+    pdv_next_row = dW_v->next_color.ptr<float>(i + 2) + 1;                                                             \
+                                                                                                                       \
+    pW_prev_row = var->weights.next_color.ptr<float>(i) + 1;                                                           \
+    pdu_prev_row = dW_u->next_color.ptr<float>(i) + 1;                                                                 \
+    pdv_prev_row = dW_v->next_color.ptr<float>(i) + 1;                                                                 \
+                                                                                                                       \
+    if (i % 2 == 0)                                                                                                    \
+    {                                                                                                                  \
+        pW_next = var->weights.next_color.ptr<float>(i + 1) + next_offs_even;                                          \
+        pdu_next = dW_u->next_color.ptr<float>(i + 1) + next_offs_even;                                                \
+        pdv_next = dW_v->next_color.ptr<float>(i + 1) + next_offs_even;                                                \
+        len = var->A11.##cur_color##_even_len;                                                                         \
+    }                                                                                                                  \
+    else                                                                                                               \
+    {                                                                                                                  \
+        pW_next = var->weights.next_color.ptr<float>(i + 1) + next_offs_odd;                                           \
+        pdu_next = dW_u->next_color.ptr<float>(i + 1) + next_offs_odd;                                                 \
+        pdv_next = dW_v->next_color.ptr<float>(i + 1) + next_offs_odd;                                                 \
+        len = var->A11.##cur_color##_odd_len;                                                                          \
+    }
         if (red_pass)
         {
-            pW = var->weights.red.ptr<float>(i + 1) + 1;
-            pa11 = var->A11.red.ptr<float>(i + 1) + 1;
-            pa12 = var->A12.red.ptr<float>(i + 1) + 1;
-            pa22 = var->A22.red.ptr<float>(i + 1) + 1;
-            pb1 = var->b1.red.ptr<float>(i + 1) + 1;
-            pb2 = var->b2.red.ptr<float>(i + 1) + 1;
-            pdu = dW_u->red.ptr<float>(i + 1) + 1;
-            pdv = dW_v->red.ptr<float>(i + 1) + 1;
-
-            pdu_next_row = dW_u->black.ptr<float>(i + 2) + 1;
-            pdv_next_row = dW_v->black.ptr<float>(i + 2) + 1;
-
-            pW_prev_row = var->weights.black.ptr<float>(i) + 1;
-            pdu_prev_row = dW_u->black.ptr<float>(i) + 1;
-            pdv_prev_row = dW_v->black.ptr<float>(i) + 1;
-
-            if (i % 2 == 0)
-            {
-                pW_next = var->weights.black.ptr<float>(i + 1) + 1;
-                pdu_next = dW_u->black.ptr<float>(i + 1) + 1;
-                pdv_next = dW_v->black.ptr<float>(i + 1) + 1;
-                len = var->A11.red_even_len;
-            }
-            else
-            {
-                pW_next = var->weights.black.ptr<float>(i + 1) + 2;
-                pdu_next = dW_u->black.ptr<float>(i + 1) + 2;
-                pdv_next = dW_v->black.ptr<float>(i + 1) + 2;
-                len = var->A11.red_odd_len;
-            }
+            INIT_ROW_POINTERS(red, black, 1, 2);
         }
         else
         {
-            pW = var->weights.black.ptr<float>(i + 1) + 1;
-            pa11 = var->A11.black.ptr<float>(i + 1) + 1;
-            pa12 = var->A12.black.ptr<float>(i + 1) + 1;
-            pa22 = var->A22.black.ptr<float>(i + 1) + 1;
-            pb1 = var->b1.black.ptr<float>(i + 1) + 1;
-            pb2 = var->b2.black.ptr<float>(i + 1) + 1;
-            pdu = dW_u->black.ptr<float>(i + 1) + 1;
-            pdv = dW_v->black.ptr<float>(i + 1) + 1;
-
-            pdu_next_row = dW_u->red.ptr<float>(i + 2) + 1;
-            pdv_next_row = dW_v->red.ptr<float>(i + 2) + 1;
-
-            pW_prev_row = var->weights.red.ptr<float>(i) + 1;
-            pdu_prev_row = dW_u->red.ptr<float>(i) + 1;
-            pdv_prev_row = dW_v->red.ptr<float>(i) + 1;
-
-            if (i % 2 == 0)
-            {
-                pW_next = var->weights.red.ptr<float>(i + 1) + 2;
-                pdu_next = dW_u->red.ptr<float>(i + 1) + 2;
-                pdv_next = dW_v->red.ptr<float>(i + 1) + 2;
-                len = var->A11.black_even_len;
-            }
-            else
-            {
-                pW_next = var->weights.red.ptr<float>(i + 1) + 1;
-                pdu_next = dW_u->red.ptr<float>(i + 1) + 1;
-                pdv_next = dW_v->red.ptr<float>(i + 1) + 1;
-                len = var->A11.black_odd_len;
-            }
+            INIT_ROW_POINTERS(black, red, 2, 1);
         }
         j = 0;
 #ifdef CV_SIMD128
         v_float32x4 pW_prev_vec = v_setall_f32(pW_next[-1]);
         v_float32x4 pdu_prev_vec = v_setall_f32(pdu_next[-1]);
         v_float32x4 pdv_prev_vec = v_setall_f32(pdv_next[-1]);
-        v_float32x4 omega_vec = v_setall_f32(omega);
+        v_float32x4 omega_vec = v_setall_f32(var->omega);
         v_float32x4 pW_vec, pW_next_vec, pW_prev_row_vec;
         v_float32x4 pdu_next_vec, pdu_prev_row_vec, pdu_next_row_vec;
         v_float32x4 pdv_next_vec, pdv_prev_row_vec, pdv_next_row_vec;
@@ -1119,9 +1063,10 @@ void VariationalRefinementImpl::RedBlackSOR_ParBody::operator()(const Range &ran
                      pW[j] * pdu_next_row[j];
             sigmaV = pW_next[j - 1] * pdv_next[j - 1] + pW[j] * pdv_next[j] + pW_prev_row[j] * pdv_prev_row[j] +
                      pW[j] * pdv_next_row[j];
-            pdu[j] += omega * ((sigmaU + pb1[j] - pdv[j] * pa12[j]) / pa11[j] - pdu[j]);
-            pdv[j] += omega * ((sigmaV + pb2[j] - pdu[j] * pa12[j]) / pa22[j] - pdv[j]);
+            pdu[j] += var->omega * ((sigmaU + pb1[j] - pdv[j] * pa12[j]) / pa11[j] - pdu[j]);
+            pdv[j] += var->omega * ((sigmaV + pb2[j] - pdu[j] * pa12[j]) / pa22[j] - pdv[j]);
         }
+#undef INIT_ROW_POINTERS
     }
 }
 
@@ -1139,6 +1084,7 @@ void VariationalRefinementImpl::calc(InputArray I0, InputArray I1, InputOutputAr
     calcUV(I0, I1, uv[0], uv[1]);
     merge(uv, 2, flowMat);
 }
+
 void VariationalRefinementImpl::calcUV(InputArray I0, InputArray I1, InputOutputArray flow_u, InputOutputArray flow_v)
 {
     CV_Assert(!I0.empty() && I0.depth() == CV_8U && I0.channels() == 1);
@@ -1166,28 +1112,26 @@ void VariationalRefinementImpl::calcUV(InputArray I0, InputArray I1, InputOutput
     dW_u.black.setTo(0.0f);
     dW_v.red.setTo(0.0f);
     dW_v.black.setTo(0.0f);
-    
 
     for (int i = 0; i < fixedPointIterations; i++)
     {
         parallel_for_(Range(0, num_stripes), ComputeDataTerm_ParBody(*this, num_stripes, I0Mat.rows, dW_u, dW_v, true));
-        parallel_for_(Range(0, num_stripes),
-                      ComputeDataTerm_ParBody(*this, num_stripes, I0Mat.rows, dW_u, dW_v, false));
+        parallel_for_(Range(0, num_stripes), ComputeDataTerm_ParBody(*this, num_stripes, I0Mat.rows, dW_u, dW_v, false));
 
-        parallel_for_(Range(0, num_stripes), ComputeSmoothnessTermHorPass_ParBody(*this, num_stripes, I0Mat.rows, W_u_rb,
-                                                                           W_v_rb, tempW_u, tempW_v, true));
-        parallel_for_(Range(0, num_stripes), ComputeSmoothnessTermHorPass_ParBody(*this, num_stripes, I0Mat.rows, W_u_rb,
-                                                                           W_v_rb, tempW_u, tempW_v, false));
-        parallel_for_(Range(0, num_stripes), ComputeSmoothnessTermVertPass_ParBody(*this, num_stripes, I0Mat.rows, W_u_rb,
-            W_v_rb, true));
-        parallel_for_(Range(0, num_stripes), ComputeSmoothnessTermVertPass_ParBody(*this, num_stripes, I0Mat.rows, W_u_rb,
-            W_v_rb, false));
+        parallel_for_(Range(0, num_stripes), ComputeSmoothnessTermHorPass_ParBody(
+                                               *this, num_stripes, I0Mat.rows, W_u_rb, W_v_rb, tempW_u, tempW_v, true));
+        parallel_for_(Range(0, num_stripes), ComputeSmoothnessTermHorPass_ParBody(
+                                               *this, num_stripes, I0Mat.rows, W_u_rb, W_v_rb, tempW_u, tempW_v, false));
+
+        parallel_for_(Range(0, num_stripes),
+                      ComputeSmoothnessTermVertPass_ParBody(*this, num_stripes, I0Mat.rows, W_u_rb, W_v_rb, true));
+        parallel_for_(Range(0, num_stripes),
+                      ComputeSmoothnessTermVertPass_ParBody(*this, num_stripes, I0Mat.rows, W_u_rb, W_v_rb, false));
 
         for (int j = 0; j < sorIterations; j++)
         {
             parallel_for_(Range(0, num_stripes), RedBlackSOR_ParBody(*this, num_stripes, I0Mat.rows, dW_u, dW_v, true));
-            parallel_for_(Range(0, num_stripes),
-                          RedBlackSOR_ParBody(*this, num_stripes, I0Mat.rows, dW_u, dW_v, false));
+            parallel_for_(Range(0, num_stripes), RedBlackSOR_ParBody(*this, num_stripes, I0Mat.rows, dW_u, dW_v, false));
         }
 
         tempW_u.red = W_u_rb.red + dW_u.red;
@@ -1202,20 +1146,6 @@ void VariationalRefinementImpl::calcUV(InputArray I0, InputArray I1, InputOutput
 }
 void VariationalRefinementImpl::collectGarbage()
 {
-    A11.release();
-    A12.release();
-    A22.release();
-    b1.release();
-    b2.release();
-    weights.release();
-    tempW_u.release();
-    tempW_v.release();
-    dW_u.release();
-    dW_v.release();
-
-    mapX.release();
-    mapY.release();
-
     Ix.release();
     Iy.release();
     Iz.release();
@@ -1224,6 +1154,32 @@ void VariationalRefinementImpl::collectGarbage()
     Iyy.release();
     Ixz.release();
     Iyz.release();
+
+    Ix_rb.release();
+    Iy_rb.release();
+    Iz_rb.release();
+    Ixx_rb.release();
+    Ixy_rb.release();
+    Iyy_rb.release();
+    Ixz_rb.release();
+    Iyz_rb.release();
+
+    A11.release();
+    A12.release();
+    A22.release();
+    b1.release();
+    b2.release();
+    weights.release();
+
+    mapX.release();
+    mapY.release();
+
+    tempW_u.release();
+    tempW_v.release();
+    dW_u.release();
+    dW_v.release();
+    W_u_rb.release();
+    W_v_rb.release();
 }
 
 Ptr<VariationalRefinement> createVariationalFlowRefinement() { return makePtr<VariationalRefinementImpl>(); }

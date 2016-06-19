@@ -48,13 +48,12 @@ void MakeArtificialExample(Mat &dst_frame1, Mat &dst_frame2);
 typedef tuple<String, Size> DISParams;
 typedef TestBaseWithParam<DISParams> DenseOpticalFlow_DIS;
 
-PERF_TEST_P(DenseOpticalFlow_DIS, perf, Combine(Values("PRESET_ULTRAFAST", "PRESET_FAST",
-                                                       "PRESET_MEDIUM"),
-                                                Values(szVGA, sz720p, sz1080p)))
+PERF_TEST_P(DenseOpticalFlow_DIS, perf,
+            Combine(Values("PRESET_ULTRAFAST", "PRESET_FAST", "PRESET_MEDIUM"), Values(szVGA, sz720p, sz1080p)))
 {
     DISParams params = GetParam();
 
-    //use strings to print preset names in the perf test results:
+    // use strings to print preset names in the perf test results:
     String preset_string = get<0>(params);
     int preset = DISOpticalFlow::PRESET_FAST;
     if (preset_string == "PRESET_ULTRAFAST")
@@ -87,17 +86,18 @@ void MakeArtificialExample(Mat &dst_frame1, Mat &dst_frame2)
     int OF_scale = 6;
     double sigma = dst_frame1.cols / 300;
 
-    Mat tmp(Size(dst_frame1.cols / pow(2, src_scale), dst_frame1.rows / pow(2, src_scale)), CV_8U);
+    Mat tmp(Size(dst_frame1.cols / (int)pow(2, src_scale), dst_frame1.rows / (int)pow(2, src_scale)), CV_8U);
     randu(tmp, 0, 255);
     resize(tmp, dst_frame1, dst_frame1.size(), 0.0, 0.0, INTER_LINEAR);
     resize(tmp, dst_frame2, dst_frame2.size(), 0.0, 0.0, INTER_LINEAR);
 
-    Mat displacement_field(Size(dst_frame1.cols / pow(2, OF_scale), dst_frame1.rows / pow(2, OF_scale)), CV_32FC2);
+    Mat displacement_field(Size(dst_frame1.cols / (int)pow(2, OF_scale), dst_frame1.rows / (int)pow(2, OF_scale)),
+                           CV_32FC2);
     randn(displacement_field, 0.0, sigma);
     resize(displacement_field, displacement_field, dst_frame2.size(), 0.0, 0.0, INTER_CUBIC);
     for (int i = 0; i < displacement_field.rows; i++)
         for (int j = 0; j < displacement_field.cols; j++)
-            displacement_field.at<Vec2f>(i, j) += Vec2f(j, i);
+            displacement_field.at<Vec2f>(i, j) += Vec2f((float)j, (float)i);
 
     remap(dst_frame2, dst_frame2, displacement_field, Mat(), INTER_LINEAR, BORDER_REPLICATE);
 }

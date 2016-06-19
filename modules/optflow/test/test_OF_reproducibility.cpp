@@ -73,7 +73,7 @@ TEST_P(DenseOpticalFlow_DIS, MultithreadReproducibility)
 
         Ptr<DISOpticalFlow> algo = createOptFlow_DIS();
         int psz = rng.uniform(4, 16);
-        int pstr = rng.uniform(1, psz-1);
+        int pstr = rng.uniform(1, psz - 1);
         int grad_iter = rng.uniform(1, 64);
         int var_iter = rng.uniform(0, 10);
         algo->setFinestScale(0);
@@ -91,13 +91,13 @@ TEST_P(DenseOpticalFlow_DIS, MultithreadReproducibility)
         algo->calc(frame1, frame2, resSingleThread);
 
         EXPECT_LE(cv::norm(resSingleThread, resMultiThread, NORM_INF), MAX_DIF);
-        EXPECT_LE(cv::norm(resSingleThread, resMultiThread, NORM_L1), MAX_MEAN_DIF*frame1.total());
+        EXPECT_LE(cv::norm(resSingleThread, resMultiThread, NORM_L1), MAX_MEAN_DIF * frame1.total());
 
-        //resulting flow should within the frame bounds:
+        // resulting flow should be within the frame bounds:
         double min_val, max_val;
         minMaxLoc(resMultiThread, &min_val, &max_val);
-        EXPECT_LE(abs(min_val), sqrt(size.height*size.height + size.width*size.width));
-        EXPECT_LE(abs(max_val), sqrt(size.height*size.height + size.width*size.width));
+        EXPECT_LE(abs(min_val), sqrt(size.height * size.height + size.width * size.width));
+        EXPECT_LE(abs(max_val), sqrt(size.height * size.height + size.width * size.width));
     }
 }
 
@@ -142,13 +142,13 @@ TEST_P(DenseOpticalFlow_VariationalRefinement, MultithreadReproducibility)
         var->calc(frame1, frame2, resSingleThread);
 
         EXPECT_LE(cv::norm(resSingleThread, resMultiThread, NORM_INF), MAX_DIF);
-        EXPECT_LE(cv::norm(resSingleThread, resMultiThread, NORM_L1), MAX_MEAN_DIF*frame1.total());
+        EXPECT_LE(cv::norm(resSingleThread, resMultiThread, NORM_L1), MAX_MEAN_DIF * frame1.total());
 
-        //resulting flow should within the frame bounds:
+        // resulting flow should be within the frame bounds:
         double min_val, max_val;
         minMaxLoc(resMultiThread, &min_val, &max_val);
-        EXPECT_LE(abs(min_val), sqrt(size.height*size.height + size.width*size.width));
-        EXPECT_LE(abs(max_val), sqrt(size.height*size.height + size.width*size.width));
+        EXPECT_LE(abs(min_val), sqrt(size.height * size.height + size.width * size.width));
+        EXPECT_LE(abs(max_val), sqrt(size.height * size.height + size.width * size.width));
     }
 }
 

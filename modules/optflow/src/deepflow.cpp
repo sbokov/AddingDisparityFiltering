@@ -167,8 +167,8 @@ void OpticalFlowDeepFlow::calc( InputArray _I0, InputArray _I1, InputOutputArray
 
     Mat I0, I1;
 
-    I0temp.convertTo(I0, CV_32F);
-    I1temp.convertTo(I1, CV_32F);
+    I0temp.convertTo(I0, CV_8U);
+    I1temp.convertTo(I1, CV_8U);
 
     _flow.create(I0.size(), CV_32FC2);
     Mat W = _flow.getMat(); // if any data present - will be discarded
@@ -189,8 +189,14 @@ void OpticalFlowDeepFlow::calc( InputArray _I0, InputArray _I1, InputOutputArray
 
     for ( int level = levelCount - 1; level >= 0; --level )
     { //iterate through  all levels, beginning with the most coarse
-        calcOneLevel(pyramid_I0[level], pyramid_I1[level], W);
-        if ( level > 0 ) //not the last level
+        Ptr<VariationalRefinement> var = createVariationalFlowRefinement();
+        var->setAlpha(4 * alpha);
+        var->setDelta(delta / 2);
+        var->setGamma(gamma / 2);
+        var->setSorIterations(sorIterations);
+        var->setFixedPointIterations(fixedPointIterations);
+        var->calc(pyramid_I0[level], pyramid_I1[level], W);
+        if (level > 0) //not the last level
         {
             Mat temp;
             Size newSize = pyramid_I0[level - 1].size();

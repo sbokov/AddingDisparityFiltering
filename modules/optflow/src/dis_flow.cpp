@@ -66,7 +66,6 @@ class DISOpticalFlowImpl : public DISOpticalFlow
     int patch_stride;
     int grad_descent_iter;
     int variational_refinement_iter;
-    int num_stripes;
     int border_size;
 
   public: // getters and setters
@@ -145,7 +144,6 @@ DISOpticalFlowImpl::DISOpticalFlowImpl()
     patch_stride = 4;
     grad_descent_iter = 16;
     variational_refinement_iter = 5;
-    num_stripes = getNumThreads();
     border_size = 16;
 
     int max_possible_scales = 10;
@@ -614,6 +612,7 @@ void DISOpticalFlowImpl::calc(InputArray I0, InputArray I1, InputOutputArray flo
     flow.create(I1Mat.size(), CV_32FC2);
     Mat &flowMat = flow.getMatRef();
     coarsest_scale = (int)(log((2 * I0Mat.cols) / (4.0 * patch_size)) / log(2.0) + 0.5) - 1;
+    int num_stripes = getNumThreads();
 
     prepareBuffers(I0Mat, I1Mat);
     Ux[coarsest_scale].setTo(0.0f);

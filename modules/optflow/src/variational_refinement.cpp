@@ -63,7 +63,6 @@ class VariationalRefinementImpl : public VariationalRefinement
     float omega;
     float alpha, delta, gamma;
     float zeta, epsilon;
-    int num_stripes;
 
   public: // getters and setters
     int getFixedPointIterations() const { return fixedPointIterations; }
@@ -214,7 +213,6 @@ VariationalRefinementImpl::VariationalRefinementImpl()
     omega = 1.6f;
     zeta = 0.1f;
     epsilon = 0.001f;
-    num_stripes = getNumThreads();
 }
 
 /////////////////// RedBlackBuffer auxiliary functions ///////////////////
@@ -1151,8 +1149,7 @@ void VariationalRefinementImpl::calcUV(InputArray I0, InputArray I1, InputOutput
     CV_Assert(I0.sameSize(flow_u));
     CV_Assert(flow_u.sameSize(flow_v));
 
-    double startTick, time;
-
+    int num_stripes = getNumThreads();
     Mat I0Mat = I0.getMat();
     Mat I1Mat = I1.getMat();
     Mat &W_u = flow_u.getMatRef();

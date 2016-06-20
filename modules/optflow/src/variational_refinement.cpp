@@ -153,9 +153,9 @@ class VariationalRefinementImpl : public VariationalRefinement
     struct ComputeDataTerm_ParBody : public ParallelLoopBody
     {
         VariationalRefinementImpl *var;
-        RedBlackBuffer *dW_u, *dW_v;
         int nstripes, stripe_sz;
         int h;
+        RedBlackBuffer *dW_u, *dW_v;
         bool red_pass;
 
         ComputeDataTerm_ParBody(VariationalRefinementImpl &_var, int _nstripes, int _h, RedBlackBuffer &_dW_u,
@@ -166,13 +166,13 @@ class VariationalRefinementImpl : public VariationalRefinement
     struct ComputeSmoothnessTermHorPass_ParBody : public ParallelLoopBody
     {
         VariationalRefinementImpl *var;
-        RedBlackBuffer *W_u, *W_v, *curW_u, *curW_v;
         int nstripes, stripe_sz;
         int h;
+        RedBlackBuffer *W_u, *W_v, *curW_u, *curW_v;
         bool red_pass;
 
         ComputeSmoothnessTermHorPass_ParBody(VariationalRefinementImpl &_var, int _nstripes, int _h,
-                                             RedBlackBuffer &W_u, RedBlackBuffer &_W_v, RedBlackBuffer &_tempW_u,
+                                             RedBlackBuffer &_W_u, RedBlackBuffer &_W_v, RedBlackBuffer &_tempW_u,
                                              RedBlackBuffer &_tempW_v, bool _red_pass);
         void operator()(const Range &range) const;
     };
@@ -180,9 +180,9 @@ class VariationalRefinementImpl : public VariationalRefinement
     struct ComputeSmoothnessTermVertPass_ParBody : public ParallelLoopBody
     {
         VariationalRefinementImpl *var;
-        RedBlackBuffer *W_u, *W_v;
         int nstripes, stripe_sz;
         int h;
+        RedBlackBuffer *W_u, *W_v;
         bool red_pass;
 
         ComputeSmoothnessTermVertPass_ParBody(VariationalRefinementImpl &_var, int _nstripes, int _h,
@@ -193,9 +193,9 @@ class VariationalRefinementImpl : public VariationalRefinement
     struct RedBlackSOR_ParBody : public ParallelLoopBody
     {
         VariationalRefinementImpl *var;
-        RedBlackBuffer *dW_u, *dW_v;
         int nstripes, stripe_sz;
         int h;
+        RedBlackBuffer *dW_u, *dW_v;
         bool red_pass;
 
         RedBlackSOR_ParBody(VariationalRefinementImpl &_var, int _nstripes, int _h, RedBlackBuffer &_dW_u,
@@ -581,9 +581,9 @@ void VariationalRefinementImpl::ComputeDataTerm_ParBody::operator()(const Range 
     pdU = dW_u->color.ptr<float>(i + 1) + 1;                                                                           \
     pdV = dW_v->color.ptr<float>(i + 1) + 1;                                                                           \
     if (i % 2 == 0)                                                                                                    \
-        len = var->Ix_rb.##color##_even_len;                                                                           \
+        len = var->Ix_rb.color##_even_len;                                                                             \
     else                                                                                                               \
-        len = var->Ix_rb.##color##_odd_len;
+        len = var->Ix_rb.color##_odd_len;
 
         if (red_pass)
         {
@@ -744,8 +744,8 @@ void VariationalRefinementImpl::ComputeSmoothnessTermHorPass_ParBody::operator()
         pB_v_next = var->b2.next_color.ptr<float>(i + 1) + next_offs_even;                                             \
         cW_v_next = curW_v->next_color.ptr<float>(i + 1) + next_offs_even;                                             \
         pW_v_next = W_v->next_color.ptr<float>(i + 1) + next_offs_even;                                                \
-        len = var->A11.##cur_color##_even_len;                                                                         \
-        if (var->A11.##cur_color##_even_len != var->A11.##cur_color##_odd_len)                                         \
+        len = var->A11.cur_color##_even_len;                                                                           \
+        if (var->A11.cur_color##_even_len != var->A11.cur_color##_odd_len)                                             \
             touches_right_border = bool_default;                                                                       \
         else                                                                                                           \
             touches_right_border = !bool_default;                                                                      \
@@ -760,8 +760,8 @@ void VariationalRefinementImpl::ComputeSmoothnessTermHorPass_ParBody::operator()
         pB_v_next = var->b2.next_color.ptr<float>(i + 1) + next_offs_odd;                                              \
         cW_v_next = curW_v->next_color.ptr<float>(i + 1) + next_offs_odd;                                              \
         pW_v_next = W_v->next_color.ptr<float>(i + 1) + next_offs_odd;                                                 \
-        len = var->A11.##cur_color##_odd_len;                                                                          \
-        if (var->A11.##cur_color##_even_len != var->A11.##cur_color##_odd_len)                                         \
+        len = var->A11.cur_color##_odd_len;                                                                            \
+        if (var->A11.cur_color##_even_len != var->A11.cur_color##_odd_len)                                             \
             touches_right_border = !bool_default;                                                                      \
         else                                                                                                           \
             touches_right_border = bool_default;                                                                       \
@@ -777,7 +777,7 @@ void VariationalRefinementImpl::ComputeSmoothnessTermHorPass_ParBody::operator()
         {
             INIT_ROW_POINTERS(black, red, 2, 1, false);
         }
-#undef INIT_ROW_POINTERS        
+#undef INIT_ROW_POINTERS
 
 #define COMPUTE                                                                                                        \
     /* Gradients for the flow on the current fixed-point iteration: */                                                 \
@@ -897,9 +897,9 @@ void VariationalRefinementImpl::ComputeSmoothnessTermVertPass_ParBody::operator(
     pW_v_next_row = W_v->next_color.ptr<float>(i + 2) + 1;                                                             \
                                                                                                                        \
     if (i % 2 == 0)                                                                                                    \
-        len = var->A11.##cur_color##_even_len;                                                                         \
+        len = var->A11.cur_color##_even_len;                                                                           \
     else                                                                                                               \
-        len = var->A11.##cur_color##_odd_len;
+        len = var->A11.cur_color##_odd_len;
 
         if (red_pass)
         {
@@ -994,14 +994,14 @@ void VariationalRefinementImpl::RedBlackSOR_ParBody::operator()(const Range &ran
         pW_next = var->weights.next_color.ptr<float>(i + 1) + next_offs_even;                                          \
         pdu_next = dW_u->next_color.ptr<float>(i + 1) + next_offs_even;                                                \
         pdv_next = dW_v->next_color.ptr<float>(i + 1) + next_offs_even;                                                \
-        len = var->A11.##cur_color##_even_len;                                                                         \
+        len = var->A11.cur_color##_even_len;                                                                           \
     }                                                                                                                  \
     else                                                                                                               \
     {                                                                                                                  \
         pW_next = var->weights.next_color.ptr<float>(i + 1) + next_offs_odd;                                           \
         pdu_next = dW_u->next_color.ptr<float>(i + 1) + next_offs_odd;                                                 \
         pdv_next = dW_v->next_color.ptr<float>(i + 1) + next_offs_odd;                                                 \
-        len = var->A11.##cur_color##_odd_len;                                                                          \
+        len = var->A11.cur_color##_odd_len;                                                                            \
     }
         if (red_pass)
         {
@@ -1037,11 +1037,11 @@ void VariationalRefinementImpl::RedBlackSOR_ParBody::operator()(const Range &ran
             pdv_next_row_vec = v_load(pdv_next_row + j);
             pa12_vec = v_load(pa12 + j);
             pW_shifted_vec = v_reinterpret_as_f32(
-              v_extract<3, v_int32x4>(v_reinterpret_as_s32(pW_prev_vec), v_reinterpret_as_s32(pW_next_vec)));
+              v_extract<3>(v_reinterpret_as_s32(pW_prev_vec), v_reinterpret_as_s32(pW_next_vec)));
             pdu_shifted_vec = v_reinterpret_as_f32(
-              v_extract<3, v_int32x4>(v_reinterpret_as_s32(pdu_prev_vec), v_reinterpret_as_s32(pdu_next_vec)));
+              v_extract<3>(v_reinterpret_as_s32(pdu_prev_vec), v_reinterpret_as_s32(pdu_next_vec)));
             pdv_shifted_vec = v_reinterpret_as_f32(
-              v_extract<3, v_int32x4>(v_reinterpret_as_s32(pdv_prev_vec), v_reinterpret_as_s32(pdv_next_vec)));
+              v_extract<3>(v_reinterpret_as_s32(pdv_prev_vec), v_reinterpret_as_s32(pdv_next_vec)));
 
             sigmaU_vec = pW_shifted_vec * pdu_shifted_vec + pW_vec * pdu_next_vec + pW_prev_row_vec * pdu_prev_row_vec +
                          pW_vec * pdu_next_row_vec;

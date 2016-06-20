@@ -118,11 +118,11 @@ class DISOpticalFlowImpl : public DISOpticalFlow
     struct PatchGradientDescent_ParBody : public ParallelLoopBody
     {
         DISOpticalFlowImpl *dis;
-        Mat *Sx, *Sy, *Ux, *Uy, *I0, *I1, *I0x, *I0y;
         int nstripes, stripe_sz;
         int hs;
+        Mat *Sx, *Sy, *Ux, *Uy, *I0, *I1, *I0x, *I0y;
 
-        PatchGradientDescent_ParBody(DISOpticalFlowImpl &_dis, int _nstripes, int _h, Mat &dst_Sx, Mat &dst_Sy,
+        PatchGradientDescent_ParBody(DISOpticalFlowImpl &_dis, int _nstripes, int _hs, Mat &dst_Sx, Mat &dst_Sy,
                                      Mat &src_Ux, Mat &src_Uy, Mat &_I0, Mat &_I1, Mat &_I0x, Mat &_I0y);
         void operator()(const Range &range) const;
     };
@@ -130,9 +130,9 @@ class DISOpticalFlowImpl : public DISOpticalFlow
     struct Densification_ParBody : public ParallelLoopBody
     {
         DISOpticalFlowImpl *dis;
-        Mat *Ux, *Uy, *Sx, *Sy, *I0, *I1;
         int nstripes, stripe_sz;
         int h;
+        Mat *Ux, *Uy, *Sx, *Sy, *I0, *I1;
 
         Densification_ParBody(DISOpticalFlowImpl &_dis, int _nstripes, int _h, Mat &dst_Ux, Mat &dst_Uy, Mat &src_Sx,
                               Mat &src_Sy, Mat &_I0, Mat &_I1);
@@ -362,7 +362,7 @@ inline float processPatch(float &dst_dUx, float &dst_dUy, uchar *I0_ptr, uchar *
 
         /* Preload and expand the first row of I1: */
         I1_row_16 = v_load(I1_ptr);
-        I1_row_shifted_16 = v_extract<1, v_uint8x16>(I1_row_16, I1_row_16);
+        I1_row_shifted_16 = v_extract<1>(I1_row_16, I1_row_16);
         v_expand(I1_row_16, I1_row_8, tmp);
         v_expand(I1_row_shifted_16, I1_row_shifted_8, tmp);
         v_expand(I1_row_8, I1_row_4_left, I1_row_4_right);
@@ -374,7 +374,7 @@ inline float processPatch(float &dst_dUx, float &dst_dUy, uchar *I0_ptr, uchar *
             /* Load the next row of I1: */
             I1_row_next_16 = v_load(I1_ptr);
             /* Circular shift left by 1 element: */
-            I1_row_next_shifted_16 = v_extract<1, v_uint8x16>(I1_row_next_16, I1_row_next_16);
+            I1_row_next_shifted_16 = v_extract<1>(I1_row_next_16, I1_row_next_16);
             /* Expand to 8 ushorts (we only need the first 8 values): */
             v_expand(I1_row_next_16, I1_row_next_8, tmp);
             v_expand(I1_row_next_shifted_16, I1_row_next_shifted_8, tmp);

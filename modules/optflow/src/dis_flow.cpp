@@ -65,6 +65,7 @@ class DISOpticalFlowImpl : public DISOpticalFlow
     int patch_stride;
     int grad_descent_iter;
     int variational_refinement_iter;
+    bool use_mean_normalization;
 
   protected: //!< some auxiliary variables
     int border_size;
@@ -82,6 +83,8 @@ class DISOpticalFlowImpl : public DISOpticalFlow
     void setGradientDescentIterations(int val) { grad_descent_iter = val; }
     int getVariationalRefinementIterations() const { return variational_refinement_iter; }
     void setVariationalRefinementIterations(int val) { variational_refinement_iter = val; }
+    bool getUseMeanNormalization() const { return use_mean_normalization; }
+    void setUseMeanNormalization(bool val) { use_mean_normalization = val; }
 
   protected:                      //!< internal buffers
     vector<Mat_<uchar> > I0s;     //!< Gaussian pyramid for the current frame
@@ -104,26 +107,33 @@ class DISOpticalFlowImpl : public DISOpticalFlow
     Mat_<float> I0yy_buf; //!< sum of squares of y gradient values
     Mat_<float> I0xy_buf; //!< sum of x and y gradient products
 
+    /* Extra buffers that are useful if patch mean-normalization is used: */
+    Mat_<float> I0x_buf; //!< sum of of x gradient values
+    Mat_<float> I0y_buf; //!< sum of of y gradient values
+
     /* Auxiliary buffers used in structure tensor computation: */
     Mat_<float> I0xx_buf_aux;
     Mat_<float> I0yy_buf_aux;
     Mat_<float> I0xy_buf_aux;
+    Mat_<float> I0x_buf_aux;
+    Mat_<float> I0y_buf_aux;
 
     vector<Ptr<VariationalRefinement> > variational_refinement_processors;
 
   private: //!< private methods and parallel sections
     void prepareBuffers(Mat &I0, Mat &I1);
-    void precomputeStructureTensor(Mat &dst_I0xx, Mat &dst_I0yy, Mat &dst_I0xy, Mat &I0x, Mat &I0y);
+    void precomputeStructureTensor(Mat &dst_I0xx, Mat &dst_I0yy, Mat &dst_I0xy, Mat &dst_I0x, Mat &dst_I0y, Mat &I0x,
+                                   Mat &I0y);
 
-    struct PatchGradientDescent_ParBody : public ParallelLoopBody
+    struct PatchInverseSearch_ParBody : public ParallelLoopBody
     {
         DISOpticalFlowImpl *dis;
         int nstripes, stripe_sz;
         int hs;
         Mat *Sx, *Sy, *Ux, *Uy, *I0, *I1, *I0x, *I0y;
 
-        PatchGradientDescent_ParBody(DISOpticalFlowImpl &_dis, int _nstripes, int _hs, Mat &dst_Sx, Mat &dst_Sy,
-                                     Mat &src_Ux, Mat &src_Uy, Mat &_I0, Mat &_I1, Mat &_I0x, Mat &_I0y);
+        PatchInverseSearch_ParBody(DISOpticalFlowImpl &_dis, int _nstripes, int _hs, Mat &dst_Sx, Mat &dst_Sy,
+                                   Mat &src_Ux, Mat &src_Uy, Mat &_I0, Mat &_I1, Mat &_I0x, Mat &_I0y);
         void operator()(const Range &range) const;
     };
 
@@ -148,6 +158,7 @@ DISOpticalFlowImpl::DISOpticalFlowImpl()
     grad_descent_iter = 16;
     variational_refinement_iter = 5;
     border_size = 16;
+    use_mean_normalization = true;
 
     /* Use separate variational refinement instances for different scales to avoid repeated memory allocation: */
     int max_possible_scales = 10;
@@ -186,9 +197,15 @@ void DISOpticalFlowImpl::prepareBuffers(Mat &I0, Mat &I1)
             I0xx_buf.create(cur_rows / patch_stride, cur_cols / patch_stride);
             I0yy_buf.create(cur_rows / patch_stride, cur_cols / patch_stride);
             I0xy_buf.create(cur_rows / patch_stride, cur_cols / patch_stride);
+            I0x_buf.create(cur_rows / patch_stride, cur_cols / patch_stride);
+            I0y_buf.create(cur_rows / patch_stride, cur_cols / patch_stride);
+
             I0xx_buf_aux.create(cur_rows, cur_cols / patch_stride);
             I0yy_buf_aux.create(cur_rows, cur_cols / patch_stride);
             I0xy_buf_aux.create(cur_rows, cur_cols / patch_stride);
+            I0x_buf_aux.create(cur_rows, cur_cols / patch_stride);
+            I0y_buf_aux.create(cur_rows, cur_cols / patch_stride);
+
             U.create(cur_rows, cur_cols);
         }
         else if (i > finest_scale)
@@ -225,20 +242,25 @@ void DISOpticalFlowImpl::prepareBuffers(Mat &I0, Mat &I1)
  * A simple box filter is not used instead because we need to compute these sums on a sparse grid
  * and store them densely in the output buffers.
  */
-void DISOpticalFlowImpl::precomputeStructureTensor(Mat &dst_I0xx, Mat &dst_I0yy, Mat &dst_I0xy, Mat &I0x, Mat &I0y)
+void DISOpticalFlowImpl::precomputeStructureTensor(Mat &dst_I0xx, Mat &dst_I0yy, Mat &dst_I0xy, Mat &dst_I0x,
+                                                   Mat &dst_I0y, Mat &I0x, Mat &I0y)
 {
     float *I0xx_ptr = dst_I0xx.ptr<float>();
     float *I0yy_ptr = dst_I0yy.ptr<float>();
     float *I0xy_ptr = dst_I0xy.ptr<float>();
+    float *I0x_ptr = dst_I0x.ptr<float>();
+    float *I0y_ptr = dst_I0y.ptr<float>();
 
     float *I0xx_aux_ptr = I0xx_buf_aux.ptr<float>();
     float *I0yy_aux_ptr = I0yy_buf_aux.ptr<float>();
     float *I0xy_aux_ptr = I0xy_buf_aux.ptr<float>();
+    float *I0x_aux_ptr = I0x_buf_aux.ptr<float>();
+    float *I0y_aux_ptr = I0y_buf_aux.ptr<float>();
 
     /* Separable box filter: horizontal pass */
     for (int i = 0; i < h; i++)
     {
-        float sum_xx = 0.0f, sum_yy = 0.0f, sum_xy = 0.0f;
+        float sum_xx = 0.0f, sum_yy = 0.0f, sum_xy = 0.0f, sum_x = 0.0f, sum_y = 0.0f;
         short *x_row = I0x.ptr<short>(i);
         short *y_row = I0y.ptr<short>(i);
         for (int j = 0; j < patch_size; j++)
@@ -246,35 +268,47 @@ void DISOpticalFlowImpl::precomputeStructureTensor(Mat &dst_I0xx, Mat &dst_I0yy,
             sum_xx += x_row[j] * x_row[j];
             sum_yy += y_row[j] * y_row[j];
             sum_xy += x_row[j] * y_row[j];
+            sum_x += x_row[j];
+            sum_y += y_row[j];
         }
         I0xx_aux_ptr[i * ws] = sum_xx;
         I0yy_aux_ptr[i * ws] = sum_yy;
         I0xy_aux_ptr[i * ws] = sum_xy;
+        I0x_aux_ptr[i * ws] = sum_x;
+        I0y_aux_ptr[i * ws] = sum_y;
         int js = 1;
         for (int j = patch_size; j < w; j++)
         {
             sum_xx += (x_row[j] * x_row[j] - x_row[j - patch_size] * x_row[j - patch_size]);
             sum_yy += (y_row[j] * y_row[j] - y_row[j - patch_size] * y_row[j - patch_size]);
             sum_xy += (x_row[j] * y_row[j] - x_row[j - patch_size] * y_row[j - patch_size]);
+            sum_x += (x_row[j] - x_row[j - patch_size]);
+            sum_y += (y_row[j] - y_row[j - patch_size]);
             if ((j - patch_size + 1) % patch_stride == 0)
             {
                 I0xx_aux_ptr[i * ws + js] = sum_xx;
                 I0yy_aux_ptr[i * ws + js] = sum_yy;
                 I0xy_aux_ptr[i * ws + js] = sum_xy;
+                I0x_aux_ptr[i * ws + js] = sum_x;
+                I0y_aux_ptr[i * ws + js] = sum_y;
                 js++;
             }
         }
     }
 
-    AutoBuffer<float> sum_xx_buf(ws), sum_yy_buf(ws), sum_xy_buf(ws);
+    AutoBuffer<float> sum_xx_buf(ws), sum_yy_buf(ws), sum_xy_buf(ws), sum_x_buf(ws), sum_y_buf(ws);
     float *sum_xx = (float *)sum_xx_buf;
     float *sum_yy = (float *)sum_yy_buf;
     float *sum_xy = (float *)sum_xy_buf;
+    float *sum_x = (float *)sum_x_buf;
+    float *sum_y = (float *)sum_y_buf;
     for (int j = 0; j < ws; j++)
     {
         sum_xx[j] = 0.0f;
         sum_yy[j] = 0.0f;
         sum_xy[j] = 0.0f;
+        sum_x[j] = 0.0f;
+        sum_y[j] = 0.0f;
     }
 
     /* Separable box filter: vertical pass */
@@ -284,12 +318,16 @@ void DISOpticalFlowImpl::precomputeStructureTensor(Mat &dst_I0xx, Mat &dst_I0yy,
             sum_xx[j] += I0xx_aux_ptr[i * ws + j];
             sum_yy[j] += I0yy_aux_ptr[i * ws + j];
             sum_xy[j] += I0xy_aux_ptr[i * ws + j];
+            sum_x[j] += I0x_aux_ptr[i * ws + j];
+            sum_y[j] += I0y_aux_ptr[i * ws + j];
         }
     for (int j = 0; j < ws; j++)
     {
         I0xx_ptr[j] = sum_xx[j];
         I0yy_ptr[j] = sum_yy[j];
         I0xy_ptr[j] = sum_xy[j];
+        I0x_ptr[j] = sum_x[j];
+        I0y_ptr[j] = sum_y[j];
     }
     int is = 1;
     for (int i = patch_size; i < h; i++)
@@ -299,6 +337,8 @@ void DISOpticalFlowImpl::precomputeStructureTensor(Mat &dst_I0xx, Mat &dst_I0yy,
             sum_xx[j] += (I0xx_aux_ptr[i * ws + j] - I0xx_aux_ptr[(i - patch_size) * ws + j]);
             sum_yy[j] += (I0yy_aux_ptr[i * ws + j] - I0yy_aux_ptr[(i - patch_size) * ws + j]);
             sum_xy[j] += (I0xy_aux_ptr[i * ws + j] - I0xy_aux_ptr[(i - patch_size) * ws + j]);
+            sum_x[j] += (I0x_aux_ptr[i * ws + j] - I0x_aux_ptr[(i - patch_size) * ws + j]);
+            sum_y[j] += (I0y_aux_ptr[i * ws + j] - I0y_aux_ptr[(i - patch_size) * ws + j]);
         }
         if ((i - patch_size + 1) % patch_stride == 0)
         {
@@ -307,16 +347,18 @@ void DISOpticalFlowImpl::precomputeStructureTensor(Mat &dst_I0xx, Mat &dst_I0yy,
                 I0xx_ptr[is * ws + j] = sum_xx[j];
                 I0yy_ptr[is * ws + j] = sum_yy[j];
                 I0xy_ptr[is * ws + j] = sum_xy[j];
+                I0x_ptr[is * ws + j] = sum_x[j];
+                I0y_ptr[is * ws + j] = sum_y[j];
             }
             is++;
         }
     }
 }
 
-DISOpticalFlowImpl::PatchGradientDescent_ParBody::PatchGradientDescent_ParBody(DISOpticalFlowImpl &_dis, int _nstripes,
-                                                                               int _hs, Mat &dst_Sx, Mat &dst_Sy,
-                                                                               Mat &src_Ux, Mat &src_Uy, Mat &_I0,
-                                                                               Mat &_I1, Mat &_I0x, Mat &_I0y)
+DISOpticalFlowImpl::PatchInverseSearch_ParBody::PatchInverseSearch_ParBody(DISOpticalFlowImpl &_dis, int _nstripes,
+                                                                           int _hs, Mat &dst_Sx, Mat &dst_Sy,
+                                                                           Mat &src_Ux, Mat &src_Uy, Mat &_I0, Mat &_I1,
+                                                                           Mat &_I0x, Mat &_I0y)
     : dis(&_dis), nstripes(_nstripes), hs(_hs), Sx(&dst_Sx), Sy(&dst_Sy), Ux(&src_Ux), Uy(&src_Uy), I0(&_I0), I1(&_I1),
       I0x(&_I0x), I0y(&_I0y)
 {
@@ -357,8 +399,6 @@ inline float processPatch(float &dst_dUx, float &dst_dUy, uchar *I0_ptr, uchar *
         v_int16x8 I0x_row, I0y_row;
         v_int32x4 I0x_row_4_left, I0x_row_4_right, I0y_row_4_left, I0y_row_4_right;
         v_float32x4 I_diff;
-        v_int32x4 Ux_mul_left, Ux_mul_right, Uy_mul_left, Uy_mul_right;
-        v_int32x4 SSD_mul_left, SSD_mul_right;
 
         /* Preload and expand the first row of I1: */
         I1_row_16 = v_load(I1_ptr);
@@ -452,7 +492,140 @@ inline float processPatch(float &dst_dUx, float &dst_dUy, uchar *I0_ptr, uchar *
     return SSD;
 }
 
-void DISOpticalFlowImpl::PatchGradientDescent_ParBody::operator()(const Range &range) const
+/* Same as processPatch, but with patch mean normalization, which improves robustness under changing
+ * lighting conditions
+ */
+inline float processPatchMeanNorm(float &dst_dUx, float &dst_dUy, uchar *I0_ptr, uchar *I1_ptr, short *I0x_ptr,
+                                  short *I0y_ptr, int I0_stride, int I1_stride, float w00, float w01, float w10,
+                                  float w11, int patch_sz, float x_grad_sum, float y_grad_sum)
+{
+    float diff;
+    float sum_diff = 0.0, sum_diff_sq = 0.0;
+    float sum_I0x_mul = 0.0, sum_I0y_mul = 0.0;
+    float n = (float)patch_sz * patch_sz;
+
+#ifdef CV_SIMD128
+    if (patch_sz == 8)
+    {
+        /* Variables to accumulate the sums */
+        v_float32x4 sum_I0x_mul_vec = v_setall_f32(0);
+        v_float32x4 sum_I0y_mul_vec = v_setall_f32(0);
+        v_float32x4 sum_diff_vec = v_setall_f32(0);
+        v_float32x4 sum_diff_sq_vec = v_setall_f32(0);
+
+        /* Bilinear weights */
+        v_float32x4 w00v = v_setall_f32(w00);
+        v_float32x4 w01v = v_setall_f32(w01);
+        v_float32x4 w10v = v_setall_f32(w10);
+        v_float32x4 w11v = v_setall_f32(w11);
+
+        v_uint8x16 I0_row_16, I1_row_16, I1_row_shifted_16, I1_row_next_16, I1_row_next_shifted_16;
+        v_uint16x8 I0_row_8, I1_row_8, I1_row_shifted_8, I1_row_next_8, I1_row_next_shifted_8, tmp;
+        v_uint32x4 I0_row_4_left, I1_row_4_left, I1_row_shifted_4_left, I1_row_next_4_left, I1_row_next_shifted_4_left;
+        v_uint32x4 I0_row_4_right, I1_row_4_right, I1_row_shifted_4_right, I1_row_next_4_right,
+          I1_row_next_shifted_4_right;
+
+        v_int16x8 I0x_row, I0y_row;
+        v_int32x4 I0x_row_4_left, I0x_row_4_right, I0y_row_4_left, I0y_row_4_right;
+        v_float32x4 I_diff;
+
+        /* Preload and expand the first row of I1: */
+        I1_row_16 = v_load(I1_ptr);
+        I1_row_shifted_16 = v_extract<1>(I1_row_16, I1_row_16);
+        v_expand(I1_row_16, I1_row_8, tmp);
+        v_expand(I1_row_shifted_16, I1_row_shifted_8, tmp);
+        v_expand(I1_row_8, I1_row_4_left, I1_row_4_right);
+        v_expand(I1_row_shifted_8, I1_row_shifted_4_left, I1_row_shifted_4_right);
+        I1_ptr += I1_stride;
+
+        for (int row = 0; row < 8; row++)
+        {
+            /* Load the next row of I1: */
+            I1_row_next_16 = v_load(I1_ptr);
+            /* Circular shift left by 1 element: */
+            I1_row_next_shifted_16 = v_extract<1>(I1_row_next_16, I1_row_next_16);
+            /* Expand to 8 ushorts (we only need the first 8 values): */
+            v_expand(I1_row_next_16, I1_row_next_8, tmp);
+            v_expand(I1_row_next_shifted_16, I1_row_next_shifted_8, tmp);
+            /* Separate the left and right halves: */
+            v_expand(I1_row_next_8, I1_row_next_4_left, I1_row_next_4_right);
+            v_expand(I1_row_next_shifted_8, I1_row_next_shifted_4_left, I1_row_next_shifted_4_right);
+
+            /* Load current rows of I0, I0x, I0y: */
+            I0_row_16 = v_load(I0_ptr);
+            v_expand(I0_row_16, I0_row_8, tmp);
+            v_expand(I0_row_8, I0_row_4_left, I0_row_4_right);
+            I0x_row = v_load(I0x_ptr);
+            v_expand(I0x_row, I0x_row_4_left, I0x_row_4_right);
+            I0y_row = v_load(I0y_ptr);
+            v_expand(I0y_row, I0y_row_4_left, I0y_row_4_right);
+
+            /* Processing the left half */
+            /* Compute difference of I0 row and bilinearly interpolated I1 row in floats: */
+            I_diff = w00v * v_cvt_f32(v_reinterpret_as_s32(I1_row_4_left)) +
+                     w01v * v_cvt_f32(v_reinterpret_as_s32(I1_row_shifted_4_left)) +
+                     w10v * v_cvt_f32(v_reinterpret_as_s32(I1_row_next_4_left)) +
+                     w11v * v_cvt_f32(v_reinterpret_as_s32(I1_row_next_shifted_4_left)) -
+                     v_cvt_f32(v_reinterpret_as_s32(I0_row_4_left));
+            /* Update the sums: */
+            sum_I0x_mul_vec += I_diff * v_cvt_f32(I0x_row_4_left);
+            sum_I0y_mul_vec += I_diff * v_cvt_f32(I0y_row_4_left);
+            sum_diff_sq_vec += I_diff * I_diff;
+            sum_diff_vec += I_diff;
+
+            /* Processing the right half */
+            I_diff = w00v * v_cvt_f32(v_reinterpret_as_s32(I1_row_4_right)) +
+                     w01v * v_cvt_f32(v_reinterpret_as_s32(I1_row_shifted_4_right)) +
+                     w10v * v_cvt_f32(v_reinterpret_as_s32(I1_row_next_4_right)) +
+                     w11v * v_cvt_f32(v_reinterpret_as_s32(I1_row_next_shifted_4_right)) -
+                     v_cvt_f32(v_reinterpret_as_s32(I0_row_4_right));
+            sum_I0x_mul_vec += I_diff * v_cvt_f32(I0x_row_4_right);
+            sum_I0y_mul_vec += I_diff * v_cvt_f32(I0y_row_4_right);
+            sum_diff_sq_vec += I_diff * I_diff;
+            sum_diff_vec += I_diff;
+
+            I0_ptr += I0_stride;
+            I0x_ptr += I0_stride;
+            I0y_ptr += I0_stride;
+            I1_ptr += I1_stride;
+
+            I1_row_4_left = I1_row_next_4_left;
+            I1_row_4_right = I1_row_next_4_right;
+            I1_row_shifted_4_left = I1_row_next_shifted_4_left;
+            I1_row_shifted_4_right = I1_row_next_shifted_4_right;
+        }
+
+        /* Final reduce operations: */
+        sum_I0x_mul = v_reduce_sum(sum_I0x_mul_vec);
+        sum_I0y_mul = v_reduce_sum(sum_I0y_mul_vec);
+        sum_diff = v_reduce_sum(sum_diff_vec);
+        sum_diff_sq = v_reduce_sum(sum_diff_sq_vec);
+    }
+    else
+    {
+#endif
+        for (int i = 0; i < patch_sz; i++)
+            for (int j = 0; j < patch_sz; j++)
+            {
+                diff = w00 * I1_ptr[i * I1_stride + j] + w01 * I1_ptr[i * I1_stride + j + 1] +
+                       w10 * I1_ptr[(i + 1) * I1_stride + j] + w11 * I1_ptr[(i + 1) * I1_stride + j + 1] -
+                       I0_ptr[i * I0_stride + j];
+
+                sum_diff += diff;
+                sum_diff_sq += diff * diff;
+
+                sum_I0x_mul += diff * I0x_ptr[i * I0_stride + j];
+                sum_I0y_mul += diff * I0y_ptr[i * I0_stride + j];
+            }
+#ifdef CV_SIMD128
+    }
+#endif
+    dst_dUx = sum_I0x_mul - sum_diff * x_grad_sum / n;
+    dst_dUy = sum_I0y_mul - sum_diff * y_grad_sum / n;
+    return sum_diff_sq - sum_diff * sum_diff / n;
+}
+
+void DISOpticalFlowImpl::PatchInverseSearch_ParBody::operator()(const Range &range) const
 {
     int start_i = min(range.start * stripe_sz, hs);
     int end_i = min(range.end * stripe_sz, hs);
@@ -479,6 +652,9 @@ void DISOpticalFlowImpl::PatchGradientDescent_ParBody::operator()(const Range &r
     float *xx_ptr = dis->I0xx_buf.ptr<float>();
     float *yy_ptr = dis->I0yy_buf.ptr<float>();
     float *xy_ptr = dis->I0xy_buf.ptr<float>();
+    /* And extra buffers for mean-normalization: */
+    float *x_ptr = dis->I0x_buf.ptr<float>();
+    float *y_ptr = dis->I0y_buf.ptr<float>();
 
     int i = start_i * dis->patch_stride;
     float i_lower_limit = bsz - psz + 1.0f;
@@ -504,6 +680,8 @@ void DISOpticalFlowImpl::PatchGradientDescent_ParBody::operator()(const Range &r
             float invH12 = -xy_ptr[is * dis->ws + js] / detH;
             float invH22 = xx_ptr[is * dis->ws + js] / detH;
             float prev_SSD = INF, SSD;
+            float x_grad_sum = x_ptr[is * dis->ws + js];
+            float y_grad_sum = y_ptr[is * dis->ws + js];
 
             for (int t = 0; t < dis->grad_descent_iter; t++)
             {
@@ -515,9 +693,15 @@ void DISOpticalFlowImpl::PatchGradientDescent_ParBody::operator()(const Range &r
                 w01 = (floor(i_I1) + 1 - i_I1) * (j_I1 - floor(j_I1));
                 w00 = (floor(i_I1) + 1 - i_I1) * (floor(j_I1) + 1 - j_I1);
 
-                SSD = processPatch(dUx, dUy, I0_ptr + i * dis->w + j, I1_ptr + (int)i_I1 * w_ext + (int)j_I1,
-                                   I0x_ptr + i * dis->w + j, I0y_ptr + i * dis->w + j, dis->w, w_ext, w00, w01, w10,
-                                   w11, psz);
+                if (dis->use_mean_normalization)
+                    SSD =
+                      processPatchMeanNorm(dUx, dUy, I0_ptr + i * dis->w + j, I1_ptr + (int)i_I1 * w_ext + (int)j_I1,
+                                           I0x_ptr + i * dis->w + j, I0y_ptr + i * dis->w + j, dis->w, w_ext, w00, w01,
+                                           w10, w11, psz, x_grad_sum, y_grad_sum);
+                else
+                    SSD = processPatch(dUx, dUy, I0_ptr + i * dis->w + j, I1_ptr + (int)i_I1 * w_ext + (int)j_I1,
+                                       I0x_ptr + i * dis->w + j, I0y_ptr + i * dis->w + j, dis->w, w_ext, w00, w01, w10,
+                                       w11, psz);
 
                 cur_Ux -= invH11 * dUx + invH12 * dUy;
                 cur_Uy -= invH12 * dUx + invH22 * dUy;
@@ -555,7 +739,7 @@ DISOpticalFlowImpl::Densification_ParBody::Densification_ParBody(DISOpticalFlowI
     stripe_sz = (int)ceil(h / (double)nstripes);
 }
 
-/* This function transforms a sparse optical flow field obtained by PatchGradientDescent (which computes flow values
+/* This function transforms a sparse optical flow field obtained by PatchInverseSearch (which computes flow values
  * on a sparse grid defined by patch_stride) into a dense optical flow field by weighted averaging of values from the
  * overlapping patches.
  */
@@ -668,9 +852,9 @@ void DISOpticalFlowImpl::calc(InputArray I0, InputArray I1, InputOutputArray flo
         ws = 1 + (w - patch_size) / patch_stride;
         hs = 1 + (h - patch_size) / patch_stride;
 
-        precomputeStructureTensor(I0xx_buf, I0yy_buf, I0xy_buf, I0xs[i], I0ys[i]);
-        parallel_for_(Range(0, num_stripes), PatchGradientDescent_ParBody(*this, num_stripes, hs, Sx, Sy, Ux[i], Uy[i],
-                                                                          I0s[i], I1s_ext[i], I0xs[i], I0ys[i]));
+        precomputeStructureTensor(I0xx_buf, I0yy_buf, I0xy_buf, I0x_buf, I0y_buf, I0xs[i], I0ys[i]);
+        parallel_for_(Range(0, num_stripes), PatchInverseSearch_ParBody(*this, num_stripes, hs, Sx, Sy, Ux[i], Uy[i],
+                                                                        I0s[i], I1s_ext[i], I0xs[i], I0ys[i]));
         parallel_for_(Range(0, num_stripes),
                       Densification_ParBody(*this, num_stripes, I0s[i].rows, Ux[i], Uy[i], Sx, Sy, I0s[i], I1s[i]));
         if (variational_refinement_iter > 0)

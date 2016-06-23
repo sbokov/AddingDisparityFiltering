@@ -301,6 +301,15 @@ public:
     CV_WRAP virtual int getVariationalRefinementIterations() const = 0;
     /** @copybrief getGradientDescentIterations @see getGradientDescentIterations */
     CV_WRAP virtual void setVariationalRefinementIterations(int val) = 0;
+
+    /** @brief Whether to use mean-normalization of patches when computing patch distance. It is turned on
+        by default as it typically provides a noticeable quality boost because of increased robustness to
+        illumanition variations. Turn it off if you are certain that your sequence does't contain any changes
+        in illumination.
+    @see setUseMeanNormalization */
+    CV_WRAP virtual bool getUseMeanNormalization() const = 0;
+    /** @copybrief getUseMeanNormalization @see getUseMeanNormalization */
+    CV_WRAP virtual void setUseMeanNormalization(bool val) = 0;
 };
 
 /** @brief Creates an instance of DISOpticalFlow

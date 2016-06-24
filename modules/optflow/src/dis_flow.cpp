@@ -66,6 +66,7 @@ class DISOpticalFlowImpl : public DISOpticalFlow
     int grad_descent_iter;
     int variational_refinement_iter;
     bool use_mean_normalization;
+    float eps;
 
   protected: //!< some auxiliary variables
     int border_size;
@@ -81,6 +82,8 @@ class DISOpticalFlowImpl : public DISOpticalFlow
     void setPatchStride(int val) { patch_stride = val; }
     int getGradientDescentIterations() const { return grad_descent_iter; }
     void setGradientDescentIterations(int val) { grad_descent_iter = val; }
+    float getGradientDescentEps() const { return eps; }
+    void setGradientDescentEps(float val) { eps = val; }
     int getVariationalRefinementIterations() const { return variational_refinement_iter; }
     void setVariationalRefinementIterations(int val) { variational_refinement_iter = val; }
     bool getUseMeanNormalization() const { return use_mean_normalization; }
@@ -159,6 +162,7 @@ DISOpticalFlowImpl::DISOpticalFlowImpl()
     variational_refinement_iter = 5;
     border_size = 16;
     use_mean_normalization = true;
+    eps = 1.0e-3f;
 
     /* Use separate variational refinement instances for different scales to avoid repeated memory allocation: */
     int max_possible_scales = 10;
@@ -661,7 +665,7 @@ void DISOpticalFlowImpl::PatchInverseSearch_ParBody::operator()(const Range &ran
     float i_upper_limit = bsz + dis->h - 1.0f;
     float j_lower_limit = bsz - psz + 1.0f;
     float j_upper_limit = bsz + dis->w - 1.0f;
-    float dUx, dUy, i_I1, j_I1, w00, w01, w10, w11;
+    float dUx, dUy, i_I1, j_I1, w00, w01, w10, w11, dx, dy;
     for (int is = start_i; is < end_i; is++)
     {
         int j = 0;
@@ -703,11 +707,13 @@ void DISOpticalFlowImpl::PatchInverseSearch_ParBody::operator()(const Range &ran
                                        I0x_ptr + i * dis->w + j, I0y_ptr + i * dis->w + j, dis->w, w_ext, w00, w01, w10,
                                        w11, psz);
 
-                cur_Ux -= invH11 * dUx + invH12 * dUy;
-                cur_Uy -= invH12 * dUx + invH22 * dUy;
+                dx = invH11 * dUx + invH12 * dUy;
+                dy = invH12 * dUx + invH22 * dUy;
+                cur_Ux -= dx;
+                cur_Uy -= dy;
 
-                /* Break when patch distance stops decreasing */
-                if (SSD > prev_SSD)
+                /* Break when patch distance stops decreasing and flow increment is below epsilon */
+                if (SSD >= prev_SSD && dx*dx + dy*dy < dis->eps)
                     break;
                 prev_SSD = SSD;
             }
@@ -920,7 +926,7 @@ Ptr<DISOpticalFlow> createOptFlow_DIS(int preset)
     {
         dis->setFinestScale(1);
         dis->setPatchStride(3);
-        dis->setGradientDescentIterations(20);
+        dis->setGradientDescentIterations(25);
         dis->setVariationalRefinementIterations(5);
     }
 

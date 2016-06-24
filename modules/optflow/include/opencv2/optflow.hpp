@@ -287,12 +287,19 @@ public:
     /** @copybrief getPatchStride @see getPatchStride */
     CV_WRAP virtual void setPatchStride(int val) = 0;
 
-    /** @brief Number of gradient descent iterations in the patch inverse search stage. Higher values may
-        improve quality in some cases.
+    /** @brief Maximum number of gradient descent iterations in the patch inverse search stage. Higher values
+        may improve quality in some cases.
         @see setGradientDescentIterations */
     CV_WRAP virtual int getGradientDescentIterations() const = 0;
     /** @copybrief getGradientDescentIterations @see getGradientDescentIterations */
     CV_WRAP virtual void setGradientDescentIterations(int val) = 0;
+
+    /** @brief An additional termination criterion in the patch inverse search. Specifies the threshold for the
+        flow increment in one iteration.
+        @see setGradientDescentEps */
+    CV_WRAP virtual float getGradientDescentEps() const = 0;
+    /** @copybrief getGradientDescentEps @see getGradientDescentEps */
+    CV_WRAP virtual void setGradientDescentEps(float val) = 0;
 
     /** @brief Number of fixed point iterations of variational refinement per scale. Set to zero to
         disable variational refinement completely. Higher values will typically result in more smooth and

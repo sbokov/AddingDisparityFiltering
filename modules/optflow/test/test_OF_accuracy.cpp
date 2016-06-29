@@ -148,7 +148,7 @@ TEST(DenseOpticalFlow_DIS, ReferenceAccuracy)
     Mat frame1, frame2, GT;
     ASSERT_TRUE(readRubberWhale(frame1, frame2, GT));
     int presets[] = {DISOpticalFlow::PRESET_ULTRAFAST, DISOpticalFlow::PRESET_FAST, DISOpticalFlow::PRESET_MEDIUM};
-    float target_RMSE[] = {0.88f, 0.75f, 0.52f};
+    float target_RMSE[] = {0.86f, 0.74f, 0.49f};
     cvtColor(frame1, frame1, COLOR_BGR2GRAY);
     cvtColor(frame2, frame2, COLOR_BGR2GRAY);
 

@@ -76,11 +76,15 @@ TEST_P(DenseOpticalFlow_DIS, MultithreadReproducibility)
         int pstr = rng.uniform(1, psz - 1);
         int grad_iter = rng.uniform(1, 64);
         int var_iter = rng.uniform(0, 10);
+        bool use_mean_normalization = !!rng.uniform(0, 2);
+        bool use_spatial_propagation = !!rng.uniform(0, 2);
         algo->setFinestScale(0);
         algo->setPatchSize(psz);
         algo->setPatchStride(pstr);
         algo->setGradientDescentIterations(grad_iter);
         algo->setVariationalRefinementIterations(var_iter);
+        algo->setUseMeanNormalization(use_mean_normalization);
+        algo->setUseSpatialPropagation(use_spatial_propagation);
 
         cv::setNumThreads(cv::getNumberOfCPUs());
         Mat resMultiThread;

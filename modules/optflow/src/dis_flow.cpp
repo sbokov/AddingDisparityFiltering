@@ -67,6 +67,7 @@ class DISOpticalFlowImpl : public DISOpticalFlow
     int variational_refinement_iter;
     bool use_mean_normalization;
     float eps;
+    bool use_spatial_propagation;
 
   protected: //!< some auxiliary variables
     int border_size;
@@ -88,6 +89,8 @@ class DISOpticalFlowImpl : public DISOpticalFlow
     void setVariationalRefinementIterations(int val) { variational_refinement_iter = val; }
     bool getUseMeanNormalization() const { return use_mean_normalization; }
     void setUseMeanNormalization(bool val) { use_mean_normalization = val; }
+    bool getUseSpatialPropagation() const { return use_spatial_propagation; }
+    void setUseSpatialPropagation(bool val) { use_spatial_propagation = val; }
 
   protected:                      //!< internal buffers
     vector<Mat_<uchar> > I0s;     //!< Gaussian pyramid for the current frame
@@ -134,9 +137,10 @@ class DISOpticalFlowImpl : public DISOpticalFlow
         int nstripes, stripe_sz;
         int hs;
         Mat *Sx, *Sy, *Ux, *Uy, *I0, *I1, *I0x, *I0y;
+        int num_iter;
 
         PatchInverseSearch_ParBody(DISOpticalFlowImpl &_dis, int _nstripes, int _hs, Mat &dst_Sx, Mat &dst_Sy,
-                                   Mat &src_Ux, Mat &src_Uy, Mat &_I0, Mat &_I1, Mat &_I0x, Mat &_I0y);
+                                   Mat &src_Ux, Mat &src_Uy, Mat &_I0, Mat &_I1, Mat &_I0x, Mat &_I0y, int _num_iter);
         void operator()(const Range &range) const;
     };
 
@@ -163,6 +167,7 @@ DISOpticalFlowImpl::DISOpticalFlowImpl()
     border_size = 16;
     use_mean_normalization = true;
     eps = 1.0e-3f;
+    use_spatial_propagation = true;
 
     /* Use separate variational refinement instances for different scales to avoid repeated memory allocation: */
     int max_possible_scales = 10;
@@ -362,12 +367,75 @@ void DISOpticalFlowImpl::precomputeStructureTensor(Mat &dst_I0xx, Mat &dst_I0yy,
 DISOpticalFlowImpl::PatchInverseSearch_ParBody::PatchInverseSearch_ParBody(DISOpticalFlowImpl &_dis, int _nstripes,
                                                                            int _hs, Mat &dst_Sx, Mat &dst_Sy,
                                                                            Mat &src_Ux, Mat &src_Uy, Mat &_I0, Mat &_I1,
-                                                                           Mat &_I0x, Mat &_I0y)
+                                                                           Mat &_I0x, Mat &_I0y, int _num_iter)
     : dis(&_dis), nstripes(_nstripes), hs(_hs), Sx(&dst_Sx), Sy(&dst_Sy), Ux(&src_Ux), Uy(&src_Uy), I0(&_I0), I1(&_I1),
-      I0x(&_I0x), I0y(&_I0y)
+      I0x(&_I0x), I0y(&_I0y), num_iter(_num_iter)
 {
     stripe_sz = (int)ceil(hs / (double)nstripes);
 }
+
+/////////////////////////////////////////////* Patch processing functions */////////////////////////////////////////////
+
+/* Some auxiliary macros */
+#define HAL_INIT_BILINEAR_8x8_PATCH_EXTRACTION                                                                         \
+    v_float32x4 w00v = v_setall_f32(w00);                                                                              \
+    v_float32x4 w01v = v_setall_f32(w01);                                                                              \
+    v_float32x4 w10v = v_setall_f32(w10);                                                                              \
+    v_float32x4 w11v = v_setall_f32(w11);                                                                              \
+                                                                                                                       \
+    v_uint8x16 I0_row_16, I1_row_16, I1_row_shifted_16, I1_row_next_16, I1_row_next_shifted_16;                        \
+    v_uint16x8 I0_row_8, I1_row_8, I1_row_shifted_8, I1_row_next_8, I1_row_next_shifted_8, tmp;                        \
+    v_uint32x4 I0_row_4_left, I1_row_4_left, I1_row_shifted_4_left, I1_row_next_4_left, I1_row_next_shifted_4_left;    \
+    v_uint32x4 I0_row_4_right, I1_row_4_right, I1_row_shifted_4_right, I1_row_next_4_right,                            \
+      I1_row_next_shifted_4_right;                                                                                     \
+    v_float32x4 I_diff_left, I_diff_right;                                                                             \
+                                                                                                                       \
+    /* Preload and expand the first row of I1: */                                                                      \
+    I1_row_16 = v_load(I1_ptr);                                                                                        \
+    I1_row_shifted_16 = v_extract<1>(I1_row_16, I1_row_16);                                                            \
+    v_expand(I1_row_16, I1_row_8, tmp);                                                                                \
+    v_expand(I1_row_shifted_16, I1_row_shifted_8, tmp);                                                                \
+    v_expand(I1_row_8, I1_row_4_left, I1_row_4_right);                                                                 \
+    v_expand(I1_row_shifted_8, I1_row_shifted_4_left, I1_row_shifted_4_right);                                         \
+    I1_ptr += I1_stride;
+
+#define HAL_PROCESS_BILINEAR_8x8_PATCH_EXTRACTION                                                                      \
+    /* Load the next row of I1: */                                                                                     \
+    I1_row_next_16 = v_load(I1_ptr);                                                                                   \
+    /* Circular shift left by 1 element: */                                                                            \
+    I1_row_next_shifted_16 = v_extract<1>(I1_row_next_16, I1_row_next_16);                                             \
+    /* Expand to 8 ushorts (we only need the first 8 values): */                                                       \
+    v_expand(I1_row_next_16, I1_row_next_8, tmp);                                                                      \
+    v_expand(I1_row_next_shifted_16, I1_row_next_shifted_8, tmp);                                                      \
+    /* Separate the left and right halves: */                                                                          \
+    v_expand(I1_row_next_8, I1_row_next_4_left, I1_row_next_4_right);                                                  \
+    v_expand(I1_row_next_shifted_8, I1_row_next_shifted_4_left, I1_row_next_shifted_4_right);                          \
+                                                                                                                       \
+    /* Load current row of I0: */                                                                                      \
+    I0_row_16 = v_load(I0_ptr);                                                                                        \
+    v_expand(I0_row_16, I0_row_8, tmp);                                                                                \
+    v_expand(I0_row_8, I0_row_4_left, I0_row_4_right);                                                                 \
+                                                                                                                       \
+    /* Compute diffs between I0 and bilinearly interpolated I1: */                                                     \
+    I_diff_left = w00v * v_cvt_f32(v_reinterpret_as_s32(I1_row_4_left)) +                                              \
+                  w01v * v_cvt_f32(v_reinterpret_as_s32(I1_row_shifted_4_left)) +                                      \
+                  w10v * v_cvt_f32(v_reinterpret_as_s32(I1_row_next_4_left)) +                                         \
+                  w11v * v_cvt_f32(v_reinterpret_as_s32(I1_row_next_shifted_4_left)) -                                 \
+                  v_cvt_f32(v_reinterpret_as_s32(I0_row_4_left));                                                      \
+    I_diff_right = w00v * v_cvt_f32(v_reinterpret_as_s32(I1_row_4_right)) +                                            \
+                   w01v * v_cvt_f32(v_reinterpret_as_s32(I1_row_shifted_4_right)) +                                    \
+                   w10v * v_cvt_f32(v_reinterpret_as_s32(I1_row_next_4_right)) +                                       \
+                   w11v * v_cvt_f32(v_reinterpret_as_s32(I1_row_next_shifted_4_right)) -                               \
+                   v_cvt_f32(v_reinterpret_as_s32(I0_row_4_right));
+
+#define HAL_BILINEAR_8x8_PATCH_EXTRACTION_NEXT_ROW                                                                     \
+    I0_ptr += I0_stride;                                                                                               \
+    I1_ptr += I1_stride;                                                                                               \
+                                                                                                                       \
+    I1_row_4_left = I1_row_next_4_left;                                                                                \
+    I1_row_4_right = I1_row_next_4_right;                                                                              \
+    I1_row_shifted_4_left = I1_row_next_shifted_4_left;                                                                \
+    I1_row_shifted_4_right = I1_row_next_shifted_4_right;
 
 /* This function essentially performs one iteration of gradient descent when finding the most similar patch in I1 for a
  * given one in I0. It assumes that I0_ptr and I1_ptr already point to the corresponding patches and w00, w01, w10, w11
@@ -388,84 +456,26 @@ inline float processPatch(float &dst_dUx, float &dst_dUy, uchar *I0_ptr, uchar *
         v_float32x4 Uy_vec = v_setall_f32(0);
         v_float32x4 SSD_vec = v_setall_f32(0);
 
-        /* Bilinear weights */
-        v_float32x4 w00v = v_setall_f32(w00);
-        v_float32x4 w01v = v_setall_f32(w01);
-        v_float32x4 w10v = v_setall_f32(w10);
-        v_float32x4 w11v = v_setall_f32(w11);
-
-        v_uint8x16 I0_row_16, I1_row_16, I1_row_shifted_16, I1_row_next_16, I1_row_next_shifted_16;
-        v_uint16x8 I0_row_8, I1_row_8, I1_row_shifted_8, I1_row_next_8, I1_row_next_shifted_8, tmp;
-        v_uint32x4 I0_row_4_left, I1_row_4_left, I1_row_shifted_4_left, I1_row_next_4_left, I1_row_next_shifted_4_left;
-        v_uint32x4 I0_row_4_right, I1_row_4_right, I1_row_shifted_4_right, I1_row_next_4_right,
-          I1_row_next_shifted_4_right;
-
         v_int16x8 I0x_row, I0y_row;
         v_int32x4 I0x_row_4_left, I0x_row_4_right, I0y_row_4_left, I0y_row_4_right;
-        v_float32x4 I_diff;
 
-        /* Preload and expand the first row of I1: */
-        I1_row_16 = v_load(I1_ptr);
-        I1_row_shifted_16 = v_extract<1>(I1_row_16, I1_row_16);
-        v_expand(I1_row_16, I1_row_8, tmp);
-        v_expand(I1_row_shifted_16, I1_row_shifted_8, tmp);
-        v_expand(I1_row_8, I1_row_4_left, I1_row_4_right);
-        v_expand(I1_row_shifted_8, I1_row_shifted_4_left, I1_row_shifted_4_right);
-        I1_ptr += I1_stride;
-
+        HAL_INIT_BILINEAR_8x8_PATCH_EXTRACTION;
         for (int row = 0; row < 8; row++)
         {
-            /* Load the next row of I1: */
-            I1_row_next_16 = v_load(I1_ptr);
-            /* Circular shift left by 1 element: */
-            I1_row_next_shifted_16 = v_extract<1>(I1_row_next_16, I1_row_next_16);
-            /* Expand to 8 ushorts (we only need the first 8 values): */
-            v_expand(I1_row_next_16, I1_row_next_8, tmp);
-            v_expand(I1_row_next_shifted_16, I1_row_next_shifted_8, tmp);
-            /* Separate the left and right halves: */
-            v_expand(I1_row_next_8, I1_row_next_4_left, I1_row_next_4_right);
-            v_expand(I1_row_next_shifted_8, I1_row_next_shifted_4_left, I1_row_next_shifted_4_right);
-
-            /* Load current rows of I0, I0x, I0y: */
-            I0_row_16 = v_load(I0_ptr);
-            v_expand(I0_row_16, I0_row_8, tmp);
-            v_expand(I0_row_8, I0_row_4_left, I0_row_4_right);
+            HAL_PROCESS_BILINEAR_8x8_PATCH_EXTRACTION;
             I0x_row = v_load(I0x_ptr);
             v_expand(I0x_row, I0x_row_4_left, I0x_row_4_right);
             I0y_row = v_load(I0y_ptr);
             v_expand(I0y_row, I0y_row_4_left, I0y_row_4_right);
 
-            /* Processing the left half */
-            /* Compute difference of I0 row and bilinearly interpolated I1 row in floats: */
-            I_diff = w00v * v_cvt_f32(v_reinterpret_as_s32(I1_row_4_left)) +
-                     w01v * v_cvt_f32(v_reinterpret_as_s32(I1_row_shifted_4_left)) +
-                     w10v * v_cvt_f32(v_reinterpret_as_s32(I1_row_next_4_left)) +
-                     w11v * v_cvt_f32(v_reinterpret_as_s32(I1_row_next_shifted_4_left)) -
-                     v_cvt_f32(v_reinterpret_as_s32(I0_row_4_left));
             /* Update the sums: */
-            Ux_vec += I_diff * v_cvt_f32(I0x_row_4_left);
-            Uy_vec += I_diff * v_cvt_f32(I0y_row_4_left);
-            SSD_vec += I_diff * I_diff;
+            Ux_vec += I_diff_left * v_cvt_f32(I0x_row_4_left) + I_diff_right * v_cvt_f32(I0x_row_4_right);
+            Uy_vec += I_diff_left * v_cvt_f32(I0y_row_4_left) + I_diff_right * v_cvt_f32(I0y_row_4_right);
+            SSD_vec += I_diff_left * I_diff_left + I_diff_right * I_diff_right;
 
-            /* Processing the right half */
-            I_diff = w00v * v_cvt_f32(v_reinterpret_as_s32(I1_row_4_right)) +
-                     w01v * v_cvt_f32(v_reinterpret_as_s32(I1_row_shifted_4_right)) +
-                     w10v * v_cvt_f32(v_reinterpret_as_s32(I1_row_next_4_right)) +
-                     w11v * v_cvt_f32(v_reinterpret_as_s32(I1_row_next_shifted_4_right)) -
-                     v_cvt_f32(v_reinterpret_as_s32(I0_row_4_right));
-            Ux_vec += I_diff * v_cvt_f32(I0x_row_4_right);
-            Uy_vec += I_diff * v_cvt_f32(I0y_row_4_right);
-            SSD_vec += I_diff * I_diff;
-
-            I0_ptr += I0_stride;
             I0x_ptr += I0_stride;
             I0y_ptr += I0_stride;
-            I1_ptr += I1_stride;
-
-            I1_row_4_left = I1_row_next_4_left;
-            I1_row_4_right = I1_row_next_4_right;
-            I1_row_shifted_4_left = I1_row_next_shifted_4_left;
-            I1_row_shifted_4_right = I1_row_next_shifted_4_right;
+            HAL_BILINEAR_8x8_PATCH_EXTRACTION_NEXT_ROW;
         }
 
         /* Final reduce operations: */
@@ -503,7 +513,6 @@ inline float processPatchMeanNorm(float &dst_dUx, float &dst_dUy, uchar *I0_ptr,
                                   short *I0y_ptr, int I0_stride, int I1_stride, float w00, float w01, float w10,
                                   float w11, int patch_sz, float x_grad_sum, float y_grad_sum)
 {
-    float diff;
     float sum_diff = 0.0, sum_diff_sq = 0.0;
     float sum_I0x_mul = 0.0, sum_I0y_mul = 0.0;
     float n = (float)patch_sz * patch_sz;
@@ -517,86 +526,27 @@ inline float processPatchMeanNorm(float &dst_dUx, float &dst_dUy, uchar *I0_ptr,
         v_float32x4 sum_diff_vec = v_setall_f32(0);
         v_float32x4 sum_diff_sq_vec = v_setall_f32(0);
 
-        /* Bilinear weights */
-        v_float32x4 w00v = v_setall_f32(w00);
-        v_float32x4 w01v = v_setall_f32(w01);
-        v_float32x4 w10v = v_setall_f32(w10);
-        v_float32x4 w11v = v_setall_f32(w11);
-
-        v_uint8x16 I0_row_16, I1_row_16, I1_row_shifted_16, I1_row_next_16, I1_row_next_shifted_16;
-        v_uint16x8 I0_row_8, I1_row_8, I1_row_shifted_8, I1_row_next_8, I1_row_next_shifted_8, tmp;
-        v_uint32x4 I0_row_4_left, I1_row_4_left, I1_row_shifted_4_left, I1_row_next_4_left, I1_row_next_shifted_4_left;
-        v_uint32x4 I0_row_4_right, I1_row_4_right, I1_row_shifted_4_right, I1_row_next_4_right,
-          I1_row_next_shifted_4_right;
-
         v_int16x8 I0x_row, I0y_row;
         v_int32x4 I0x_row_4_left, I0x_row_4_right, I0y_row_4_left, I0y_row_4_right;
-        v_float32x4 I_diff;
 
-        /* Preload and expand the first row of I1: */
-        I1_row_16 = v_load(I1_ptr);
-        I1_row_shifted_16 = v_extract<1>(I1_row_16, I1_row_16);
-        v_expand(I1_row_16, I1_row_8, tmp);
-        v_expand(I1_row_shifted_16, I1_row_shifted_8, tmp);
-        v_expand(I1_row_8, I1_row_4_left, I1_row_4_right);
-        v_expand(I1_row_shifted_8, I1_row_shifted_4_left, I1_row_shifted_4_right);
-        I1_ptr += I1_stride;
-
+        HAL_INIT_BILINEAR_8x8_PATCH_EXTRACTION;
         for (int row = 0; row < 8; row++)
         {
-            /* Load the next row of I1: */
-            I1_row_next_16 = v_load(I1_ptr);
-            /* Circular shift left by 1 element: */
-            I1_row_next_shifted_16 = v_extract<1>(I1_row_next_16, I1_row_next_16);
-            /* Expand to 8 ushorts (we only need the first 8 values): */
-            v_expand(I1_row_next_16, I1_row_next_8, tmp);
-            v_expand(I1_row_next_shifted_16, I1_row_next_shifted_8, tmp);
-            /* Separate the left and right halves: */
-            v_expand(I1_row_next_8, I1_row_next_4_left, I1_row_next_4_right);
-            v_expand(I1_row_next_shifted_8, I1_row_next_shifted_4_left, I1_row_next_shifted_4_right);
-
-            /* Load current rows of I0, I0x, I0y: */
-            I0_row_16 = v_load(I0_ptr);
-            v_expand(I0_row_16, I0_row_8, tmp);
-            v_expand(I0_row_8, I0_row_4_left, I0_row_4_right);
+            HAL_PROCESS_BILINEAR_8x8_PATCH_EXTRACTION;
             I0x_row = v_load(I0x_ptr);
             v_expand(I0x_row, I0x_row_4_left, I0x_row_4_right);
             I0y_row = v_load(I0y_ptr);
             v_expand(I0y_row, I0y_row_4_left, I0y_row_4_right);
 
-            /* Processing the left half */
-            /* Compute difference of I0 row and bilinearly interpolated I1 row in floats: */
-            I_diff = w00v * v_cvt_f32(v_reinterpret_as_s32(I1_row_4_left)) +
-                     w01v * v_cvt_f32(v_reinterpret_as_s32(I1_row_shifted_4_left)) +
-                     w10v * v_cvt_f32(v_reinterpret_as_s32(I1_row_next_4_left)) +
-                     w11v * v_cvt_f32(v_reinterpret_as_s32(I1_row_next_shifted_4_left)) -
-                     v_cvt_f32(v_reinterpret_as_s32(I0_row_4_left));
             /* Update the sums: */
-            sum_I0x_mul_vec += I_diff * v_cvt_f32(I0x_row_4_left);
-            sum_I0y_mul_vec += I_diff * v_cvt_f32(I0y_row_4_left);
-            sum_diff_sq_vec += I_diff * I_diff;
-            sum_diff_vec += I_diff;
+            sum_I0x_mul_vec += I_diff_left * v_cvt_f32(I0x_row_4_left) + I_diff_right * v_cvt_f32(I0x_row_4_right);
+            sum_I0y_mul_vec += I_diff_left * v_cvt_f32(I0y_row_4_left) + I_diff_right * v_cvt_f32(I0y_row_4_right);
+            sum_diff_sq_vec += I_diff_left * I_diff_left + I_diff_right * I_diff_right;
+            sum_diff_vec += I_diff_left + I_diff_right;
 
-            /* Processing the right half */
-            I_diff = w00v * v_cvt_f32(v_reinterpret_as_s32(I1_row_4_right)) +
-                     w01v * v_cvt_f32(v_reinterpret_as_s32(I1_row_shifted_4_right)) +
-                     w10v * v_cvt_f32(v_reinterpret_as_s32(I1_row_next_4_right)) +
-                     w11v * v_cvt_f32(v_reinterpret_as_s32(I1_row_next_shifted_4_right)) -
-                     v_cvt_f32(v_reinterpret_as_s32(I0_row_4_right));
-            sum_I0x_mul_vec += I_diff * v_cvt_f32(I0x_row_4_right);
-            sum_I0y_mul_vec += I_diff * v_cvt_f32(I0y_row_4_right);
-            sum_diff_sq_vec += I_diff * I_diff;
-            sum_diff_vec += I_diff;
-
-            I0_ptr += I0_stride;
             I0x_ptr += I0_stride;
             I0y_ptr += I0_stride;
-            I1_ptr += I1_stride;
-
-            I1_row_4_left = I1_row_next_4_left;
-            I1_row_4_right = I1_row_next_4_right;
-            I1_row_shifted_4_left = I1_row_next_shifted_4_left;
-            I1_row_shifted_4_right = I1_row_next_shifted_4_right;
+            HAL_BILINEAR_8x8_PATCH_EXTRACTION_NEXT_ROW;
         }
 
         /* Final reduce operations: */
@@ -608,6 +558,7 @@ inline float processPatchMeanNorm(float &dst_dUx, float &dst_dUy, uchar *I0_ptr,
     else
     {
 #endif
+        float diff;
         for (int i = 0; i < patch_sz; i++)
             for (int j = 0; j < patch_sz; j++)
             {
@@ -629,11 +580,91 @@ inline float processPatchMeanNorm(float &dst_dUx, float &dst_dUy, uchar *I0_ptr,
     return sum_diff_sq - sum_diff * sum_diff / n;
 }
 
+/* Similar to processPatch, but compute only the sum of squared differences (SSD) between the patches */
+inline float computeSSD(uchar *I0_ptr, uchar *I1_ptr, int I0_stride, int I1_stride, float w00, float w01, float w10,
+                        float w11, int patch_sz)
+{
+    float SSD = 0.0f;
+#ifdef CV_SIMD128
+    if (patch_sz == 8)
+    {
+        v_float32x4 SSD_vec = v_setall_f32(0);
+        HAL_INIT_BILINEAR_8x8_PATCH_EXTRACTION;
+        for (int row = 0; row < 8; row++)
+        {
+            HAL_PROCESS_BILINEAR_8x8_PATCH_EXTRACTION;
+            SSD_vec += I_diff_left * I_diff_left + I_diff_right * I_diff_right;
+            HAL_BILINEAR_8x8_PATCH_EXTRACTION_NEXT_ROW;
+        }
+        SSD = v_reduce_sum(SSD_vec);
+    }
+    else
+    {
+#endif
+        float diff;
+        for (int i = 0; i < patch_sz; i++)
+            for (int j = 0; j < patch_sz; j++)
+            {
+                diff = w00 * I1_ptr[i * I1_stride + j] + w01 * I1_ptr[i * I1_stride + j + 1] +
+                       w10 * I1_ptr[(i + 1) * I1_stride + j] + w11 * I1_ptr[(i + 1) * I1_stride + j + 1] -
+                       I0_ptr[i * I0_stride + j];
+                SSD += diff * diff;
+            }
+#ifdef CV_SIMD128
+    }
+#endif
+    return SSD;
+}
+
+/* Same as computeSSD, but with patch mean normalization */
+inline float computeSSDMeanNorm(uchar *I0_ptr, uchar *I1_ptr, int I0_stride, int I1_stride, float w00, float w01,
+                                float w10, float w11, int patch_sz)
+{
+    float sum_diff = 0.0f, sum_diff_sq = 0.0f;
+    float n = (float)patch_sz * patch_sz;
+#ifdef CV_SIMD128
+    if (patch_sz == 8)
+    {
+        v_float32x4 sum_diff_vec = v_setall_f32(0);
+        v_float32x4 sum_diff_sq_vec = v_setall_f32(0);
+        HAL_INIT_BILINEAR_8x8_PATCH_EXTRACTION;
+        for (int row = 0; row < 8; row++)
+        {
+            HAL_PROCESS_BILINEAR_8x8_PATCH_EXTRACTION;
+            sum_diff_sq_vec += I_diff_left * I_diff_left + I_diff_right * I_diff_right;
+            sum_diff_vec += I_diff_left + I_diff_right;
+            HAL_BILINEAR_8x8_PATCH_EXTRACTION_NEXT_ROW;
+        }
+        sum_diff = v_reduce_sum(sum_diff_vec);
+        sum_diff_sq = v_reduce_sum(sum_diff_sq_vec);
+    }
+    else
+    {
+#endif
+        float diff;
+        for (int i = 0; i < patch_sz; i++)
+            for (int j = 0; j < patch_sz; j++)
+            {
+                diff = w00 * I1_ptr[i * I1_stride + j] + w01 * I1_ptr[i * I1_stride + j + 1] +
+                       w10 * I1_ptr[(i + 1) * I1_stride + j] + w11 * I1_ptr[(i + 1) * I1_stride + j + 1] -
+                       I0_ptr[i * I0_stride + j];
+
+                sum_diff += diff;
+                sum_diff_sq += diff * diff;
+            }
+#ifdef CV_SIMD128
+    }
+#endif
+    return sum_diff_sq - sum_diff * sum_diff / n;
+}
+
+#undef HAL_INIT_BILINEAR_8x8_PATCH_EXTRACTION
+#undef HAL_PROCESS_BILINEAR_8x8_PATCH_EXTRACTION
+#undef HAL_BILINEAR_8x8_PATCH_EXTRACTION_NEXT_ROW
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
 void DISOpticalFlowImpl::PatchInverseSearch_ParBody::operator()(const Range &range) const
 {
-    int start_i = min(range.start * stripe_sz, hs);
-    int end_i = min(range.end * stripe_sz, hs);
-
     int psz = dis->patch_size;
     int psz2 = psz / 2;
     int w_ext = dis->w + 2 * dis->border_size; //!< width of I1_ext
@@ -660,81 +691,156 @@ void DISOpticalFlowImpl::PatchInverseSearch_ParBody::operator()(const Range &ran
     float *x_ptr = dis->I0x_buf.ptr<float>();
     float *y_ptr = dis->I0y_buf.ptr<float>();
 
-    int i = start_i * dis->patch_stride;
+    int i, j, dir;
+    int start_is, end_is, start_js, end_js;
+    int start_i, start_j;
     float i_lower_limit = bsz - psz + 1.0f;
     float i_upper_limit = bsz + dis->h - 1.0f;
     float j_lower_limit = bsz - psz + 1.0f;
     float j_upper_limit = bsz + dis->w - 1.0f;
     float dUx, dUy, i_I1, j_I1, w00, w01, w10, w11, dx, dy;
-    for (int is = start_i; is < end_i; is++)
+
+#define INIT_BILINEAR_WEIGHTS(Ux, Uy)                                                                                  \
+    i_I1 = min(max(i + Uy + bsz, i_lower_limit), i_upper_limit);                                                       \
+    j_I1 = min(max(j + Ux + bsz, j_lower_limit), j_upper_limit);                                                       \
+                                                                                                                       \
+    w11 = (i_I1 - floor(i_I1)) * (j_I1 - floor(j_I1));                                                                 \
+    w10 = (i_I1 - floor(i_I1)) * (floor(j_I1) + 1 - j_I1);                                                             \
+    w01 = (floor(i_I1) + 1 - i_I1) * (j_I1 - floor(j_I1));                                                             \
+    w00 = (floor(i_I1) + 1 - i_I1) * (floor(j_I1) + 1 - j_I1);
+
+#define COMPUTE_SSD(dst, Ux, Uy)                                                                                       \
+    INIT_BILINEAR_WEIGHTS(Ux, Uy);                                                                                     \
+    if (dis->use_mean_normalization)                                                                                   \
+        dst = computeSSDMeanNorm(I0_ptr + i * dis->w + j, I1_ptr + (int)i_I1 * w_ext + (int)j_I1, dis->w, w_ext, w00,  \
+                                 w01, w10, w11, psz);                                                                  \
+    else                                                                                                               \
+        dst = computeSSD(I0_ptr + i * dis->w + j, I1_ptr + (int)i_I1 * w_ext + (int)j_I1, dis->w, w_ext, w00, w01,     \
+                         w10, w11, psz);
+
+    int num_inner_iter = (int)floor(dis->grad_descent_iter / (float)num_iter);
+    for (int iter = 0; iter < num_iter; iter++)
     {
-        int j = 0;
-        for (int js = 0; js < dis->ws; js++)
+        if (iter % 2 == 0)
         {
-            /* Get an initial approximation from the center of the current patch: */
-            float cur_Ux = Ux_ptr[(i + psz2) * dis->w + j + psz2];
-            float cur_Uy = Uy_ptr[(i + psz2) * dis->w + j + psz2];
-
-            /* Computing the inverse of the structure tensor: */
-            float detH = xx_ptr[is * dis->ws + js] * yy_ptr[is * dis->ws + js] -
-                         xy_ptr[is * dis->ws + js] * xy_ptr[is * dis->ws + js];
-            if (abs(detH) < EPS)
-                detH = EPS;
-            float invH11 = yy_ptr[is * dis->ws + js] / detH;
-            float invH12 = -xy_ptr[is * dis->ws + js] / detH;
-            float invH22 = xx_ptr[is * dis->ws + js] / detH;
-            float prev_SSD = INF, SSD;
-            float x_grad_sum = x_ptr[is * dis->ws + js];
-            float y_grad_sum = y_ptr[is * dis->ws + js];
-
-            for (int t = 0; t < dis->grad_descent_iter; t++)
-            {
-                i_I1 = min(max(i + cur_Uy + bsz, i_lower_limit), i_upper_limit);
-                j_I1 = min(max(j + cur_Ux + bsz, j_lower_limit), j_upper_limit);
-
-                w11 = (i_I1 - floor(i_I1)) * (j_I1 - floor(j_I1));
-                w10 = (i_I1 - floor(i_I1)) * (floor(j_I1) + 1 - j_I1);
-                w01 = (floor(i_I1) + 1 - i_I1) * (j_I1 - floor(j_I1));
-                w00 = (floor(i_I1) + 1 - i_I1) * (floor(j_I1) + 1 - j_I1);
-
-                if (dis->use_mean_normalization)
-                    SSD =
-                      processPatchMeanNorm(dUx, dUy, I0_ptr + i * dis->w + j, I1_ptr + (int)i_I1 * w_ext + (int)j_I1,
-                                           I0x_ptr + i * dis->w + j, I0y_ptr + i * dis->w + j, dis->w, w_ext, w00, w01,
-                                           w10, w11, psz, x_grad_sum, y_grad_sum);
-                else
-                    SSD = processPatch(dUx, dUy, I0_ptr + i * dis->w + j, I1_ptr + (int)i_I1 * w_ext + (int)j_I1,
-                                       I0x_ptr + i * dis->w + j, I0y_ptr + i * dis->w + j, dis->w, w_ext, w00, w01, w10,
-                                       w11, psz);
-
-                dx = invH11 * dUx + invH12 * dUy;
-                dy = invH12 * dUx + invH22 * dUy;
-                cur_Ux -= dx;
-                cur_Uy -= dy;
-
-                /* Break when patch distance stops decreasing and flow increment is below epsilon */
-                if (SSD >= prev_SSD && dx*dx + dy*dy < dis->eps)
-                    break;
-                prev_SSD = SSD;
-            }
-
-            /* If gradient descent converged to a flow vector that is very far from the initial approximation
-             * (more than patch size) then we don't use it. Noticeably improves the robustness.
-             */
-            if (norm(Vec2f(cur_Ux - Ux_ptr[i * dis->w + j], cur_Uy - Uy_ptr[i * dis->w + j])) <= psz)
-            {
-                Sx_ptr[is * dis->ws + js] = cur_Ux;
-                Sy_ptr[is * dis->ws + js] = cur_Uy;
-            }
-            else
-            {
-                Sx_ptr[is * dis->ws + js] = Ux_ptr[(i + psz2) * dis->w + j + psz2];
-                Sy_ptr[is * dis->ws + js] = Uy_ptr[(i + psz2) * dis->w + j + psz2];
-            }
-            j += dis->patch_stride;
+            dir = 1;
+            start_is = min(range.start * stripe_sz, hs);
+            end_is = min(range.end * stripe_sz, hs);
+            start_js = 0;
+            end_js = dis->ws;
+            start_i = start_is * dis->patch_stride;
+            start_j = 0;
         }
-        i += dis->patch_stride;
+        else
+        {
+            dir = -1;
+            start_is = min(range.end * stripe_sz, hs) - 1;
+            end_is = min(range.start * stripe_sz, hs) - 1;
+            start_js = dis->ws - 1;
+            end_js = -1;
+            start_i = start_is * dis->patch_stride;
+            start_j = (dis->ws - 1) * dis->patch_stride;
+        }
+
+        i = start_i;
+        for (int is = start_is; dir * is < dir * end_is; is += dir)
+        {
+            j = start_j;
+            for (int js = start_js; dir * js < dir * end_js; js += dir)
+            {
+                if (iter == 0)
+                {
+                    /* Using result form the previous pyramid level as the very first approximation: */
+                    Sx_ptr[is * dis->ws + js] = Ux_ptr[(i + psz2) * dis->w + j + psz2];
+                    Sy_ptr[is * dis->ws + js] = Uy_ptr[(i + psz2) * dis->w + j + psz2];
+                }
+
+                if (dis->use_spatial_propagation)
+                {
+                    /* Updating the current Sx_ptr, Sy_ptr to the best candidate: */
+                    float min_SSD, cur_SSD;
+                    COMPUTE_SSD(min_SSD, Sx_ptr[is * dis->ws + js], Sy_ptr[is * dis->ws + js]);
+                    if (dir * js > dir * start_js)
+                    {
+                        COMPUTE_SSD(cur_SSD, Sx_ptr[is * dis->ws + js - dir], Sy_ptr[is * dis->ws + js - dir]);
+                        if (cur_SSD < min_SSD)
+                        {
+                            min_SSD = cur_SSD;
+                            Sx_ptr[is * dis->ws + js] = Sx_ptr[is * dis->ws + js - dir];
+                            Sy_ptr[is * dis->ws + js] = Sy_ptr[is * dis->ws + js - dir];
+                        }
+                    }
+                    /* Flow vectors won't actually propagate across different stripes, which is the reason for keeping
+                     * the number of stripes constant. It works well enough in practice and doesn't introduce any
+                     * visible seams.
+                     */
+                    if (dir * is > dir * start_is)
+                    {
+                        COMPUTE_SSD(cur_SSD, Sx_ptr[(is - dir) * dis->ws + js], Sy_ptr[(is - dir) * dis->ws + js]);
+                        if (cur_SSD < min_SSD)
+                        {
+                            min_SSD = cur_SSD;
+                            Sx_ptr[is * dis->ws + js] = Sx_ptr[(is - dir) * dis->ws + js];
+                            Sy_ptr[is * dis->ws + js] = Sy_ptr[(is - dir) * dis->ws + js];
+                        }
+                    }
+                }
+
+                /* Use the best candidate as a starting point for the gradient descent: */
+                float cur_Ux = Sx_ptr[is * dis->ws + js];
+                float cur_Uy = Sy_ptr[is * dis->ws + js];
+
+                /* Computing the inverse of the structure tensor: */
+                float detH = xx_ptr[is * dis->ws + js] * yy_ptr[is * dis->ws + js] -
+                             xy_ptr[is * dis->ws + js] * xy_ptr[is * dis->ws + js];
+                if (abs(detH) < EPS)
+                    detH = EPS;
+                float invH11 = yy_ptr[is * dis->ws + js] / detH;
+                float invH12 = -xy_ptr[is * dis->ws + js] / detH;
+                float invH22 = xx_ptr[is * dis->ws + js] / detH;
+                float prev_SSD = INF, SSD;
+                float x_grad_sum = x_ptr[is * dis->ws + js];
+                float y_grad_sum = y_ptr[is * dis->ws + js];
+
+                for (int t = 0; t < num_inner_iter; t++)
+                {
+                    INIT_BILINEAR_WEIGHTS(cur_Ux, cur_Uy);
+                    if (dis->use_mean_normalization)
+                        SSD = processPatchMeanNorm(dUx, dUy, I0_ptr + i * dis->w + j,
+                                                   I1_ptr + (int)i_I1 * w_ext + (int)j_I1, I0x_ptr + i * dis->w + j,
+                                                   I0y_ptr + i * dis->w + j, dis->w, w_ext, w00, w01, w10, w11, psz,
+                                                   x_grad_sum, y_grad_sum);
+                    else
+                        SSD = processPatch(dUx, dUy, I0_ptr + i * dis->w + j, I1_ptr + (int)i_I1 * w_ext + (int)j_I1,
+                                           I0x_ptr + i * dis->w + j, I0y_ptr + i * dis->w + j, dis->w, w_ext, w00, w01,
+                                           w10, w11, psz);
+
+                    dx = invH11 * dUx + invH12 * dUy;
+                    dy = invH12 * dUx + invH22 * dUy;
+                    cur_Ux -= dx;
+                    cur_Uy -= dy;
+
+                    /* Break when patch distance stops decreasing and flow increment is below epsilon */
+                    if (SSD >= prev_SSD && dx * dx + dy * dy < dis->eps)
+                        break;
+                    prev_SSD = SSD;
+                }
+
+                /* If gradient descent converged to a flow vector that is very far from the initial approximation
+                 * (more than patch size) then we don't use it. Noticeably improves the robustness.
+                 */
+                if (norm(Vec2f(cur_Ux - Sx_ptr[is * dis->ws + js], cur_Uy - Sy_ptr[is * dis->ws + js])) <= psz)
+                {
+                    Sx_ptr[is * dis->ws + js] = cur_Ux;
+                    Sy_ptr[is * dis->ws + js] = cur_Uy;
+                }
+                j += dir * dis->patch_stride;
+            }
+            i += dir * dis->patch_stride;
+        }
     }
+#undef INIT_BILINEAR_WEIGHTS
+#undef COMPUTE_SSD
 }
 
 DISOpticalFlowImpl::Densification_ParBody::Densification_ParBody(DISOpticalFlowImpl &_dis, int _nstripes, int _h,
@@ -830,6 +936,8 @@ void DISOpticalFlowImpl::Densification_ParBody::operator()(const Range &range) c
             Uy_ptr[i * dis->w + j] = sum_Uy / sum_coef;
         }
     }
+#undef UPDATE_SPARSE_I_COORDINATES
+#undef UPDATE_SPARSE_J_COORDINATES
 }
 
 void DISOpticalFlowImpl::calc(InputArray I0, InputArray I1, InputOutputArray flow)
@@ -859,8 +967,21 @@ void DISOpticalFlowImpl::calc(InputArray I0, InputArray I1, InputOutputArray flo
         hs = 1 + (h - patch_size) / patch_stride;
 
         precomputeStructureTensor(I0xx_buf, I0yy_buf, I0xy_buf, I0x_buf, I0y_buf, I0xs[i], I0ys[i]);
-        parallel_for_(Range(0, num_stripes), PatchInverseSearch_ParBody(*this, num_stripes, hs, Sx, Sy, Ux[i], Uy[i],
-                                                                        I0s[i], I1s_ext[i], I0xs[i], I0ys[i]));
+        if (use_spatial_propagation)
+        {
+            /* Use a fixed number of stripes regardless the number of threads to make inverse search
+             * with spatial propagation reproducible
+             */
+            parallel_for_(Range(0, 8), PatchInverseSearch_ParBody(*this, 8, hs, Sx, Sy, Ux[i], Uy[i], I0s[i],
+                                                                  I1s_ext[i], I0xs[i], I0ys[i], 2));
+        }
+        else
+        {
+            parallel_for_(Range(0, num_stripes),
+                          PatchInverseSearch_ParBody(*this, num_stripes, hs, Sx, Sy, Ux[i], Uy[i], I0s[i], I1s_ext[i],
+                                                     I0xs[i], I0ys[i], 1));
+        }
+
         parallel_for_(Range(0, num_stripes),
                       Densification_ParBody(*this, num_stripes, I0s[i].rows, Ux[i], Uy[i], Sx, Sy, I0s[i], I1s[i]));
         if (variational_refinement_iter > 0)

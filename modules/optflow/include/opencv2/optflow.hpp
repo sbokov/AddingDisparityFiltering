@@ -317,6 +317,15 @@ public:
     CV_WRAP virtual bool getUseMeanNormalization() const = 0;
     /** @copybrief getUseMeanNormalization @see getUseMeanNormalization */
     CV_WRAP virtual void setUseMeanNormalization(bool val) = 0;
+
+    /** @brief Whether to use spatial propagation of good optical flow vectors. This option is turned on by
+        default, as it tends to work better on average and can sometimes help recover from major errors
+        introduced by the coarse-to-fine scheme employed by the DIS optical flow algorithm. Turning this
+        option off can make the output flow field a bit smoother, however.
+    @see setUseSpatialPropagation */
+    CV_WRAP virtual bool getUseSpatialPropagation() const = 0;
+    /** @copybrief getSpatialPropagation @see getSpatialPropagation */
+    CV_WRAP virtual void setUseSpatialPropagation(bool val) = 0;
 };
 
 /** @brief Creates an instance of DISOpticalFlow

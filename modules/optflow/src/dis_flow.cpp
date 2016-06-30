@@ -665,6 +665,13 @@ inline float computeSSDMeanNorm(uchar *I0_ptr, uchar *I1_ptr, int I0_stride, int
 
 void DISOpticalFlowImpl::PatchInverseSearch_ParBody::operator()(const Range &range) const
 {
+    // force separate processing of stripes if we are using spatial propagation:
+    if(dis->use_spatial_propagation && range.end>range.start+1)
+    {
+        for(int n=range.start;n<range.end;n++)
+            (*this)(Range(n,n+1));
+        return;
+    }
     int psz = dis->patch_size;
     int psz2 = psz / 2;
     int w_ext = dis->w + 2 * dis->border_size; //!< width of I1_ext

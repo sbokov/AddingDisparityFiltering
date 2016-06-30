@@ -324,7 +324,7 @@ public:
         option off can make the output flow field a bit smoother, however.
     @see setUseSpatialPropagation */
     CV_WRAP virtual bool getUseSpatialPropagation() const = 0;
-    /** @copybrief getSpatialPropagation @see getSpatialPropagation */
+    /** @copybrief getUseSpatialPropagation @see getUseSpatialPropagation */
     CV_WRAP virtual void setUseSpatialPropagation(bool val) = 0;
 };
 

@@ -66,7 +66,6 @@ class DISOpticalFlowImpl : public DISOpticalFlow
     int grad_descent_iter;
     int variational_refinement_iter;
     bool use_mean_normalization;
-    float eps;
     bool use_spatial_propagation;
 
   protected: //!< some auxiliary variables
@@ -83,8 +82,6 @@ class DISOpticalFlowImpl : public DISOpticalFlow
     void setPatchStride(int val) { patch_stride = val; }
     int getGradientDescentIterations() const { return grad_descent_iter; }
     void setGradientDescentIterations(int val) { grad_descent_iter = val; }
-    float getGradientDescentEps() const { return eps; }
-    void setGradientDescentEps(float val) { eps = val; }
     int getVariationalRefinementIterations() const { return variational_refinement_iter; }
     void setVariationalRefinementIterations(int val) { variational_refinement_iter = val; }
     bool getUseMeanNormalization() const { return use_mean_normalization; }
@@ -166,7 +163,6 @@ DISOpticalFlowImpl::DISOpticalFlowImpl()
     variational_refinement_iter = 5;
     border_size = 16;
     use_mean_normalization = true;
-    eps = 1.0e-3f;
     use_spatial_propagation = true;
 
     /* Use separate variational refinement instances for different scales to avoid repeated memory allocation: */
@@ -827,8 +823,8 @@ void DISOpticalFlowImpl::PatchInverseSearch_ParBody::operator()(const Range &ran
                     cur_Ux -= dx;
                     cur_Uy -= dy;
 
-                    /* Break when patch distance stops decreasing and flow increment is below epsilon */
-                    if (SSD >= prev_SSD && dx * dx + dy * dy < dis->eps)
+                    /* Break when patch distance stops decreasing */
+                    if (SSD >= prev_SSD)
                         break;
                     prev_SSD = SSD;
                 }
